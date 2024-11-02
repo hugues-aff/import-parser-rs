@@ -1,4 +1,5 @@
-use std::borrow::Cow;
+mod cache;
+
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs::read_to_string;
@@ -6,12 +7,14 @@ use std::io;
 use dashmap::DashMap;
 use pyo3::create_exception;
 use pyo3::prelude::*;
-use pyo3::exceptions::{PyException, PyOSError, PyValueError};
+use pyo3::exceptions::{PyException, PyOSError, PyTypeError, PyValueError};
+use pyo3::types::{PyFrozenSet, PyNone, PySequence, PySet, PyString, PyTuple};
 use ruff_text_size::{Ranged, TextRange};
 use ruff_python_parser::{parse_module, Token, TokenKind};
 use walkdir::WalkDir;
 
 create_exception!(import_parser_rs, MismatchedOverrideComments, PyValueError);
+
 
 fn mismatched_comments(t: &str, line: usize) -> PyErr {
     PyErr::new::<MismatchedOverrideComments, _>(format!("unmatched override {} at line {}", t, line))
@@ -62,12 +65,12 @@ fn imports_from_module(source: &str,
                        start_override_comment: &str,
                        end_override_comment: &str,
                        deep: bool,
-) -> Result<(HashSet<Cow<'static, str>>, HashSet<Cow<'static, str>>), PyErr> {
+) -> Result<FileImports, PyErr> {
     match parse_module(source) {
         Err(error) => Err(PyException::new_err(error.to_string())),
         Ok(m) => {
-            let mut imports : HashSet<Cow<'static, str>> = HashSet::new();
-            let mut ignored_imports : HashSet<Cow<'static, str>> = HashSet::new();
+            let mut imports : HashSet<cache::CachedPy<String>> = HashSet::new();
+            let mut ignored_imports : HashSet<cache::CachedPy<String>> = HashSet::new();
 
             let mut token_it = m.tokens().iter();
             let mut override_range = TextRange::empty(0.into());
@@ -98,7 +101,7 @@ fn imports_from_module(source: &str,
                 if stmt.is_import_stmt() {
                     let imp = stmt.as_import_stmt().unwrap();
                     for n in &imp.names {
-                        dest.insert(Cow::from(n.name.to_string()));
+                        dest.insert(cache::CachedPy::new(n.name.to_string(), freeze_string));
                     }
                 } else if stmt.is_import_from_stmt() {
                     let imp = stmt.as_import_from_stmt().unwrap();
@@ -108,7 +111,7 @@ fn imports_from_module(source: &str,
                     }
                     let prefix = imp.module.as_ref().unwrap().to_string() + ".";
                     for n in &imp.names {
-                        dest.insert(Cow::from(prefix.clone() + n.name.as_str()));
+                        dest.insert(cache::CachedPy::new(prefix.clone() + n.name.as_str(), freeze_string));
                     }
                 } else if deep {
                     // TODO:
@@ -116,7 +119,7 @@ fn imports_from_module(source: &str,
                 }
             }
 
-            Ok((imports, ignored_imports))
+            Ok(FileImports::new(imports, ignored_imports))
         }
     }
 }
@@ -126,7 +129,7 @@ fn get_all_imports_no_gil(
     start_override_comment: &str,
     end_override_comment: &str,
     deep: bool,
-) -> PyResult<(HashSet<Cow<'static, str>>, HashSet<Cow<'static, str>>)> {
+) -> PyResult<FileImports> {
     match read_to_string(filepath) {
         Err(err) => Err(PyOSError::new_err(err)),
         Ok(source) => imports_from_module(
@@ -179,11 +182,62 @@ where
 }
 
 
+
+struct FileImports {
+    valid: cache::CachedPy<HashSet<cache::CachedPy<String>>>,
+    ignored: cache::CachedPy<HashSet<cache::CachedPy<String>>>,
+}
+
+fn freeze_set<T: ToPyObject>(py: Python<'_>, s: &HashSet<T>) -> PyObject {
+    // TODO: instead of creating a new frozenset, have a custom Set implementation
+    // that provide read-only access to the underlying rust HashSet
+    // this would save on memory allocation, and copy, at the cost of added
+    // overhead (py->rust transition) when working with the object
+    PyFrozenSet::new_bound(py, s).unwrap().to_object(py)
+}
+
+fn freeze_string(py: Python<'_>, s: &String) -> PyObject {
+    PyString::new_bound(py, s.as_str()).to_object(py)
+}
+
+impl FileImports {
+    fn new(valid: HashSet<cache::CachedPy<String>>, ignored: HashSet<cache::CachedPy<String>>) -> Self {
+        FileImports{
+            valid: cache::CachedPy::new(valid, freeze_set),
+            ignored: cache::CachedPy::new(ignored, freeze_set),
+        }
+    }
+}
+
+impl ToPyObject for FileImports {
+    fn to_object(&self, py: Python<'_>) -> PyObject {
+        PyTuple::new_bound(
+            py, vec![self.valid.to_object(py), self.ignored.to_object(py)]
+        ).to_object(py)
+    }
+}
+
+impl IntoPy<PyObject> for FileImports {
+    fn into_py(self, py: Python<'_>) -> PyObject {
+        self.to_object(py)
+    }
+}
+
+impl Clone for FileImports {
+    fn clone(&self) -> FileImports {
+        FileImports{
+            valid: self.valid.clone(),
+            ignored: self.ignored.clone(),
+        }
+    }
+}
+
+
 pub struct _ImportParser {
     start_override_comment: String,
     end_override_comment: String,
     // NB: use a concurrency-safe container to allow the Python side to leverage threading
-    cache: DashMap<String, (HashSet<Cow<'static, str>>, HashSet<Cow<'static, str>>)>,
+    cache: DashMap<String, FileImports>,
 }
 
 impl _ImportParser {
@@ -195,8 +249,8 @@ impl _ImportParser {
         }
     }
 
-    pub fn get_all_imports(&mut self, filepath: String, deep: bool)
-        -> PyResult<(HashSet<Cow<'static, str>>, HashSet<Cow<'static, str>>)> {
+    fn get_all_imports(&self, filepath: String, deep: bool)
+        -> PyResult<FileImports> {
         match self.cache.get(&filepath) {
             Some(r) => {
                 Ok(r.value().clone())
@@ -209,7 +263,7 @@ impl _ImportParser {
                     deep
                 ) {
                     Ok(r) => {
-                        self.cache.insert(filepath, r.clone());
+                        self.cache.insert(filepath.clone(), r.clone());
                         Ok(r)
                     },
                     Err(err) => Err(err),
@@ -218,55 +272,74 @@ impl _ImportParser {
         }
     }
 
-    pub fn get_recursive_imports(&mut self,
+    pub fn get_recursive_imports(&self,
                                       directories: Vec<String>,
                                       ignore: Vec<String>,
-    ) -> PyResult<(HashMap<Cow<'static, str>, HashSet<Cow<'static, str>>>, HashSet<Cow<'static, str>>)> {
-        let mut all_imports: HashMap<Cow<'static, str>, HashSet<Cow<'static, str>>> = HashMap::new();
-        let mut all_ignored: HashSet<Cow<'static, str>> = HashSet::new();
+    ) -> PyResult<(HashMap<cache::CachedPy<String>, HashSet<cache::CachedPy<String>>>, HashSet<cache::CachedPy<String>>)> {
+        let mut all_imports: HashMap<cache::CachedPy<String>, HashSet<cache::CachedPy<String>>> = HashMap::new();
+        let mut all_ignored: HashSet<cache::CachedPy<String>> = HashSet::new();
 
-        let mut collect_ = |filepath: &Cow<'static, str>, valid: &HashSet<Cow<'static, str>>, ignored: &HashSet<Cow<'static, str>>| {
-            for v in valid {
-                all_imports.entry(v.clone()).or_insert(HashSet::new()).insert(filepath.clone());
+        let mut collect_ = |filepath: &cache::CachedPy<String>, file_imports: &FileImports|  {
+            for v in file_imports.valid.as_ref() {
+                all_imports.entry(v.clone())
+                    .or_insert(HashSet::new())
+                    .insert(filepath.clone());
             }
-            for i in ignored {
+            for i in file_imports.ignored.as_ref() {
                 all_ignored.insert(i.clone());
             }
         };
 
         match for_each_python_file(&directories, &ignore, |filepath| {
             let r = self.cache.get(filepath);
-            let cowpath: Cow<'static, str> = Cow::from(filepath.to_string());
+            let cowpath: cache::CachedPy<String> = cache::CachedPy::new(filepath.to_string(), freeze_string);
             match r {
                 Some(r) => {
-                    let (valid, ignored) = r.value();
-                    collect_(&cowpath, valid, ignored)
+                    collect_(&cowpath, r.value())
                 }
                 None => {
-                    let r = get_all_imports_no_gil(
+                    match get_all_imports_no_gil(
                         &filepath,
                         &self.start_override_comment,
                         &self.end_override_comment,
                         false
-                    );
-                    if r.is_err() {
-                        return Some(r.err().unwrap())
+                    ) {
+                        Err(err) => return Some(err),
+                        Ok(r) => {
+                            collect_(&cowpath, &r);
+                            self.cache.insert(filepath.to_string(), r);
+                        }
                     }
-                    let (valid, ignored) = r.unwrap();
-                    collect_(&cowpath, &valid, &ignored);
-                    self.cache.insert(filepath.to_string(), (valid, ignored));
                 }
             }
             None
         }) {
-            Some(err) => return Err(err),
-            None => return Ok((all_imports, all_ignored)),
+            Some(err) => Err(err),
+            None => Ok((all_imports, all_ignored)),
         }
     }
 }
 
+fn to_vec<'py, T>(v: Bound<'py, PyAny>) -> PyResult<Vec<T>>
+where
+    T: FromPyObject<'py>
+{
+    if let Ok(_) = v.downcast::<PyNone>() {
+        Ok(vec![])
+    } else if let Ok(seq) = v.downcast::<PySequence>() {
+        Ok(seq.extract::<Vec<T>>().unwrap())
+    } else if let Ok(set) = v.downcast::<PySet>() {
+        let mut r = Vec::with_capacity(set.len());
+        for v in set {
+            r.push(v.extract::<T>().unwrap());
+        }
+        Ok(r)
+    } else {
+        Err(PyErr::new::<PyTypeError, _>("Expected a sequence or a set"))
+    }
+}
 
-#[pyclass(subclass, module="import_parser_rs")]
+#[pyclass(subclass, frozen, module="import_parser_rs")]
 pub struct ImportParser {
     _p: _ImportParser,
 }
@@ -282,8 +355,8 @@ impl ImportParser {
     }
 
     #[pyo3(signature = (filepath, deep=false))]
-    pub fn get_all_imports<'py>(&mut self, py: Python<'py>, filepath: String, deep: bool)
-        -> PyResult<(HashSet<Cow<'static, str>>, HashSet<Cow<'static, str>>)> {
+    pub fn get_all_imports<'py>(&self, py: Python<'py>, filepath: String, deep: bool)
+        -> PyResult<FileImports> {
         // all python->rust conversion happens prior to this function being called
         // all rust->python conversion happens after this function returning
         // exception ctors are specifically deferred to avoid creation without holding the GIL
@@ -291,16 +364,26 @@ impl ImportParser {
         py.allow_threads(|| self._p.get_all_imports(filepath, deep))
     }
 
-    #[pyo3(signature = (directories, ignore=vec![]))]
-    pub fn get_recursive_imports<'py>(&mut self, py: Python<'py>,
-                                      directories: Vec<String>,
-                                      ignore: Vec<String>,
-    ) -> PyResult<(HashMap<Cow<'static, str>, HashSet<Cow<'static, str>>>, HashSet<Cow<'static, str>>)> {
-        // all python->rust conversion happens prior to this function being called
-        // all rust->python conversion happens after this function returning
-        // exception ctors are specifically deferred to avoid creation without holding the GIL
-        // therefore we can safely release the GIL here
-        py.allow_threads(|| self._p.get_recursive_imports(directories, ignore))
+    #[pyo3(signature = (directories, ignore=None))]
+    pub fn get_recursive_imports<'py>(&self, py: Python<'py>,
+                                      directories: Bound<'py, PyAny>,
+                                      ignore: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<(HashMap<cache::CachedPy<String>, HashSet<cache::CachedPy<String>>>, HashSet<cache::CachedPy<String>>)> {
+        let ignore_vec ;
+        if ignore.is_none() {
+            ignore_vec = Ok(vec![])
+        } else {
+            ignore_vec = to_vec(ignore.unwrap())
+        }
+        if let (Ok(directories), Ok(ignore)) = (to_vec(directories), ignore_vec) {
+            // all python->rust conversion happens prior to this function being called
+            // all rust->python conversion happens after this function returning
+            // exception ctors are specifically deferred to avoid creation without holding the GIL
+            // therefore we can safely release the GIL here
+            py.allow_threads(|| self._p.get_recursive_imports(directories, ignore))
+        } else {
+            Err(PyErr::new::<PyTypeError, _>("Expected directories nad ignore to be a sequence or a set"))
+        }
     }
 }
 
