@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "import-parser-rs"
+requires-python = ">=3.7"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+]
+dynamic = ["version"]
+[tool.maturin]
+# Control the platform tag on linux
+compatibility = "manylinux2014"
+# auditwheel mode, possible values are repair, check and skip
+auditwheel = "repair"
+features = ["pyo3/extension-module"]

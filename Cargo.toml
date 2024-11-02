@@ -1,0 +1,23 @@
+[package]
+name = "import-parser-rs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "import_parser_rs"
+crate-type = ["cdylib"]
+
+[profile.release]
+debug = 1
+
+[dependencies]
+pyo3 = { version = "0.22.0", features = ["abi3-py37", "extension-module"] }
+walkdir = "2.5"
+dashmap = "6.1"
+ruff_python_parser = { git = "https://github.com/astral-sh/ruff.git", tag = "0.7.1" }
+ruff_python_ast = { git = "https://github.com/astral-sh/ruff.git", tag = "0.7.1" }
+ruff_text_size = { git = "https://github.com/astral-sh/ruff.git", tag = "0.7.1" }
+#ruff_python_parser = { path = "../ruff/crates/ruff_python_parser" }
+#ruff_python_ast = { path = "../ruff/crates/ruff_python_ast" }
+#ruff_text_size = { path = "../ruff/crates/ruff_text_size" }
