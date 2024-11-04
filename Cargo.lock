@@ -62,6 +62,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
+name = "cmd"
+version = "0.1.2"
+dependencies = [
+ "common",
+ "pyo3",
+]
+
+[[package]]
+name = "common"
+version = "0.1.2"
+dependencies = [
+ "dashmap",
+ "pyo3",
+ "ruff_python_ast",
+ "ruff_python_parser",
+ "ruff_text_size",
+ "walkdir",
+]
+
+[[package]]
 name = "compact_str"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -137,12 +157,8 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "import-parser-rs"
 version = "0.1.2"
 dependencies = [
- "dashmap",
+ "common",
  "pyo3",
- "ruff_python_ast",
- "ruff_python_parser",
- "ruff_text_size",
- "walkdir",
 ]
 
 [[package]]
