@@ -1,7 +1,11 @@
 pub mod cache;
+pub mod matcher;
+pub mod moduleref;
+pub mod graph;
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Display;
 use std::fs::read_to_string;
 use std::io;
 use dashmap::DashMap;
@@ -9,15 +13,162 @@ use pyo3::create_exception;
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyException, PyOSError, PyValueError};
 use pyo3::types::{PyFrozenSet, PyString, PyTuple};
+use ruff_python_ast::{Stmt};
+use ruff_python_ast::visitor::source_order::{walk_stmt, SourceOrderVisitor};
 use ruff_text_size::{Ranged, TextRange};
 use ruff_python_parser::{parse_module, Token, TokenKind};
 use walkdir::WalkDir;
 
+#[derive(Debug)]
+pub struct Err {
+    pub msg: String,
+    err: Option<io::Error>,
+    py_factory: Option<fn (String) -> PyErr>,
+}
+
+impl Err {
+    fn new(msg: String, py_factory: fn(String) -> PyErr) -> Err {
+        Err {
+            msg,
+            err: None,
+            py_factory: Some(py_factory)
+        }
+    }
+
+    pub fn from_io(err: io::Error) -> Err {
+        Err {
+            msg: err.to_string(),
+            err: Some(err),
+            py_factory: None,
+        }
+    }
+
+    pub fn to_pyerr(self) -> PyErr {
+        match self.py_factory {
+            Some(f) => f(self.msg),
+            None => match self.err {
+                Some(err) => PyOSError::new_err(err),
+                None => { panic!("invalid Err") }
+            }
+        }
+    }
+}
+
+impl Display for Err {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.msg)
+    }
+}
+
+
 create_exception!(import_parser_rs, MismatchedOverrideComments, PyValueError);
 
 
-fn mismatched_comments(t: &str, line: usize) -> PyErr {
-    PyErr::new::<MismatchedOverrideComments, _>(format!("unmatched override {} at line {}", t, line))
+fn mismatched_comments(t: &str, line: usize) -> Err {
+    Err::new(
+        format!("unmatched override {} at line {}", t, line),
+        PyErr::new::<MismatchedOverrideComments, _>,
+    )
+}
+
+pub fn split_at_depth(filepath: &'_ str, sep: char, depth: usize) -> (&'_ str, &'_ str) {
+    let mut idx : usize = filepath.len();
+    let mut depth: usize = depth;
+    while depth != 0 {
+        match filepath[..idx].rfind(sep) {
+            Some(next_idx) => {
+                idx = next_idx;
+                depth -= 1;
+            },
+            None => {
+                panic!("{} @ {} {}", filepath, sep, depth);
+            }
+        }
+    }
+    (&filepath[0..idx], &filepath[idx+1..])
+}
+
+struct ImportExtractor<'a> {
+    source : &'a str,
+    module : &'a str,
+    deep: bool,
+
+    imports : Vec<String>
+}
+
+impl<'a> ImportExtractor<'a> {
+    fn new(source : &'a str, module : &'a str, deep : bool) -> ImportExtractor<'a> {
+        ImportExtractor{
+            source,
+            module,
+            deep,
+            imports: Vec::new(),
+        }
+    }
+}
+
+impl<'a, 'b> SourceOrderVisitor<'b> for ImportExtractor<'a> {
+    fn visit_stmt(&mut self, stmt: &'b Stmt) {
+        if let Some(imp) = stmt.as_import_stmt() {
+            for n in &imp.names {
+                self.imports.push(n.name.to_string());
+            }
+        } else if let Some(imp) = stmt.as_import_from_stmt() {
+            let mut target = String::new();
+            if imp.level > 0 {
+                let (parent, _) = split_at_depth(self.module, '.', imp.level as usize);
+                target.push_str(parent);
+                target.push('.');
+            }
+            if imp.module.is_some() {
+                target.push_str(imp.module.as_ref().unwrap().as_str());
+                target.push('.');
+            }
+            for n in &imp.names {
+                self.imports.push(target.clone() + n.name.as_str());
+            }
+        } else if self.deep {
+            if let Some(if_stmt) = stmt.as_if_stmt() {
+                // quick and dirty: skip if TYPE_CHECKING / if typing.TYPE_CHECKING
+                // TODO: for added robustness:
+                //  - keep track of imports from typing package
+                //  - extract identifer from if condition and compare to imported symbol
+                let range = if_stmt.test.range();
+                let cond = &self.source[range.start().to_usize()..range.end().to_usize()];
+                if cond == "TYPE_CHECKING" || cond == "typing.TYPE_CHECKING" {
+                    // skip walking under
+                    return;
+                }
+            }
+            walk_stmt(self, stmt);
+        }
+    }
+
+    fn visit_body(&mut self, body: &'b [Stmt]) {
+        for stmt in body {
+            self.visit_stmt(stmt);
+        }
+    }
+}
+
+fn raw_imports_from_module<'a>(source: &'a str, module: &'a str, deep: bool) -> Result<Vec<String>, Err> {
+    match parse_module(source) {
+        Err(error) => Err(Err::new(error.to_string(), PyException::new_err)),
+        Ok(m) => {
+            let mut extractor = ImportExtractor::new(source, module, deep);
+            extractor.visit_body(&m.syntax().body);
+            Ok(extractor.imports)
+        }
+    }
+}
+
+pub fn raw_get_all_imports(filepath: &str, module: &str, deep: bool) -> Result<Vec<String>, Err> {
+    match read_to_string(filepath) {
+        Err(err) => Err(Err::from_io(err)),
+        Ok(source) => raw_imports_from_module(
+            &source, module, deep,
+        )
+    }
 }
 
 fn next_override_block(it: &mut core::slice::Iter<'_, Token>,
@@ -25,7 +176,7 @@ fn next_override_block(it: &mut core::slice::Iter<'_, Token>,
                        source: &str,
                        start_override_comment: &str,
                        end_override_comment: &str
-) -> Result<TextRange, PyErr> {
+) -> Result<TextRange, Err> {
     let mut start_of_line = false;
     let mut override_start_line = 1;
     let mut override_range = TextRange::empty(0.into());
@@ -65,9 +216,9 @@ fn imports_from_module(source: &str,
                        start_override_comment: &str,
                        end_override_comment: &str,
                        deep: bool,
-) -> Result<FileImports, PyErr> {
+) -> Result<FileImports, Err> {
     match parse_module(source) {
-        Err(error) => Err(PyException::new_err(error.to_string())),
+        Err(error) => Err(Err::new(error.to_string(), PyException::new_err)),
         Ok(m) => {
             let mut imports : HashSet<cache::CachedPy<String>> = HashSet::new();
             let mut ignored_imports : HashSet<cache::CachedPy<String>> = HashSet::new();
@@ -124,14 +275,14 @@ fn imports_from_module(source: &str,
     }
 }
 
-fn get_all_imports_no_gil(
+pub fn get_all_imports_no_gil(
     filepath: &str,
     start_override_comment: &str,
     end_override_comment: &str,
     deep: bool,
-) -> PyResult<FileImports> {
+) -> Result<FileImports, Err> {
     match read_to_string(filepath) {
-        Err(err) => Err(PyOSError::new_err(err)),
+        Err(err) => Err(Err::from_io(err)),
         Ok(source) => imports_from_module(
             &source,
             start_override_comment,
@@ -151,12 +302,12 @@ fn is_ignored(path: &str, ignore: &Vec<String>) -> bool {
     false
 }
 
-fn for_each_python_file<F>(directories: &Vec<String>,
+pub fn for_each_python_file<F>(directories: &Vec<String>,
                            ignore: &Vec<String>,
                            mut inner_fn: F
-) -> Option<PyErr>
+) -> Option<Err>
 where
-    F: FnMut(&str) -> Option<PyErr>
+    F: FnMut(&str) -> Option<Err>
 {
     for directory in directories.iter() {
         let walker = WalkDir::new(directory).into_iter();
@@ -167,7 +318,7 @@ where
                     is_ignored(e.path().to_str().unwrap(), ignore)))
             )) {
             if entry.is_err() {
-                return Some(PyOSError::new_err(io::Error::from(entry.err().unwrap())))
+                return Some(Err::from_io(io::Error::from(entry.err().unwrap())))
             }
             let e = entry.unwrap();
             if e.file_type().is_file() && e.file_name().to_str().unwrap().ends_with(".py") {
@@ -184,8 +335,8 @@ where
 
 
 pub struct FileImports {
-    valid: cache::CachedPy<HashSet<cache::CachedPy<String>>>,
-    ignored: cache::CachedPy<HashSet<cache::CachedPy<String>>>,
+    pub valid: cache::CachedPy<HashSet<cache::CachedPy<String>>>,
+    pub ignored: cache::CachedPy<HashSet<cache::CachedPy<String>>>,
 }
 
 fn freeze_set<T: ToPyObject>(py: Python<'_>, s: &HashSet<T>) -> PyObject {
@@ -232,6 +383,7 @@ impl Clone for FileImports {
     }
 }
 
+pub type StringSet = HashSet<cache::CachedPy<String>>;
 
 pub struct _ImportParser {
     start_override_comment: String,
@@ -250,7 +402,7 @@ impl _ImportParser {
     }
 
     pub fn get_all_imports(&self, filepath: String, deep: bool)
-                           -> PyResult<FileImports> {
+                           -> Result<FileImports, Err> {
         match self.cache.get(&filepath) {
             Some(r) => {
                 Ok(r.value().clone())
@@ -275,9 +427,9 @@ impl _ImportParser {
     pub fn get_recursive_imports(&self,
                                  directories: Vec<String>,
                                  ignore: Vec<String>,
-    ) -> PyResult<(HashMap<cache::CachedPy<String>, HashSet<cache::CachedPy<String>>>, HashSet<cache::CachedPy<String>>)> {
-        let mut all_imports: HashMap<cache::CachedPy<String>, HashSet<cache::CachedPy<String>>> = HashMap::new();
-        let mut all_ignored: HashSet<cache::CachedPy<String>> = HashSet::new();
+    ) -> Result<(HashMap<cache::CachedPy<String>, StringSet>, StringSet), Err> {
+        let mut all_imports: HashMap<cache::CachedPy<String>, StringSet> = HashMap::new();
+        let mut all_ignored: StringSet = HashSet::new();
 
         let mut collect_ = |filepath: &cache::CachedPy<String>, file_imports: &FileImports|  {
             for v in file_imports.valid.as_ref() {
@@ -292,7 +444,7 @@ impl _ImportParser {
 
         match for_each_python_file(&directories, &ignore, |filepath| {
             let r = self.cache.get(filepath);
-            let cowpath: cache::CachedPy<String> = cache::CachedPy::new(filepath.to_string(), freeze_string);
+            let cowpath = cache::CachedPy::new(filepath.to_string(), freeze_string);
             match r {
                 Some(r) => {
                     collect_(&cowpath, r.value())

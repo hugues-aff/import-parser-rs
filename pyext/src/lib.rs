@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use pyo3::prelude::*;
-use pyo3::exceptions::{PyTypeError};
-use pyo3::types::{PyNone, PySequence, PySet};
+use pyo3::exceptions::{PyException, PyTypeError};
+use pyo3::types::{PyDict, PyNone, PySequence, PySet, PyString};
 
 use common::*;
 use common::cache;
@@ -13,11 +13,11 @@ where
     if let Ok(_) = v.downcast::<PyNone>() {
         Ok(vec![])
     } else if let Ok(seq) = v.downcast::<PySequence>() {
-        Ok(seq.extract::<Vec<T>>().unwrap())
+        Ok(seq.extract::<Vec<T>>()?)
     } else if let Ok(set) = v.downcast::<PySet>() {
         let mut r = Vec::with_capacity(set.len());
         for v in set {
-            r.push(v.extract::<T>().unwrap());
+            r.push(v.extract::<T>()?);
         }
         Ok(r)
     } else {
@@ -48,14 +48,17 @@ impl ImportParser {
         // all rust->python conversion happens after this function returning
         // exception ctors are specifically deferred to avoid creation without holding the GIL
         // therefore we can safely release the GIL here
-        py.allow_threads(|| self._p.get_all_imports(filepath, deep))
+        match py.allow_threads(|| self._p.get_all_imports(filepath, deep)) {
+            Ok(r) => Ok(r),
+            Err(e) => { Err(e.to_pyerr()) }
+        }
     }
 
     #[pyo3(signature = (directories, ignore=None))]
     pub fn get_recursive_imports<'py>(&self, py: Python<'py>,
                                       directories: Bound<'py, PyAny>,
                                       ignore: Option<Bound<'py, PyAny>>,
-    ) -> PyResult<(HashMap<cache::CachedPy<String>, HashSet<cache::CachedPy<String>>>, HashSet<cache::CachedPy<String>>)> {
+    ) -> PyResult<(HashMap<cache::CachedPy<String>, StringSet>, StringSet)> {
         let ignore_vec ;
         if ignore.is_none() {
             ignore_vec = Ok(vec![])
@@ -67,7 +70,10 @@ impl ImportParser {
             // all rust->python conversion happens after this function returning
             // exception ctors are specifically deferred to avoid creation without holding the GIL
             // therefore we can safely release the GIL here
-            py.allow_threads(|| self._p.get_recursive_imports(directories, ignore))
+            match py.allow_threads(|| self._p.get_recursive_imports(directories, ignore)) {
+                Ok(r) => Ok(r),
+                Err(e) => { Err(e.to_pyerr()) }
+            }
         } else {
             Err(PyErr::new::<PyTypeError, _>("Expected directories nad ignore to be a sequence or a set"))
         }
@@ -75,9 +81,104 @@ impl ImportParser {
 
 }
 
+#[pyclass(subclass, frozen, module="import_parser_rs")]
+pub struct ModuleGraph {
+    g: graph::ModuleGraph,
+}
+
+#[pymethods]
+impl ModuleGraph {
+    #[new]
+    #[pyo3(signature = (packages, global_prefixes, local_prefixes))]
+    fn new<'py>(py: Python<'py>, packages: HashMap<String, String>,
+           global_prefixes: HashSet<String>,
+           local_prefixes: HashSet<String>,
+    ) -> PyResult<ModuleGraph> {
+        let g = ModuleGraph{
+            g: graph::ModuleGraph::new(
+                packages,
+                global_prefixes,
+                local_prefixes,
+            )
+        };
+        py.allow_threads(|| g.g.parse_parallel())
+            .or_else(|e| return Err(PyErr::new::<PyException, _>(e.to_string())))?;
+        Ok(g)
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (filepath))]
+    fn from_file<'py>(py: Python<'py>, filepath: &str) -> PyResult<ModuleGraph> {
+        Ok(ModuleGraph {
+            g: py.allow_threads(|| graph::ModuleGraph::from_file(filepath))
+                .or_else(|e| Err(PyErr::new::<PyException, _>(e.to_string())))?
+        })
+    }
+    #[pyo3(signature = (filepath))]
+    fn to_file<'py>(&self, py: Python<'py>, filepath: &str) -> PyResult<()> {
+        py.allow_threads(|| self.g.to_file(filepath))
+            .or_else(|e| Err(PyErr::new::<PyException, _>(e.to_string())))
+    }
+
+    #[pyo3(signature = (filepath))]
+    fn file_depends_on<'py>(&self, py: Python<'py>, filepath: &str) -> PyResult<PyObject>
+    {
+        Ok(match self.g.file_depends_on(filepath) {
+            None => PyNone::get_bound(py).into_py(py),
+            Some(deps) => {
+                let r = PySet::empty_bound(py)
+                    .or_else(|e| return Err(e))?;
+                for dep in deps {
+                    r.add(PyString::new_bound(py, &dep))?;
+                }
+                r.into_py(py)
+            }
+        })
+    }
+    #[pyo3(signature = (module_import_path, package_root = None))]
+    fn module_depends_on<'py>(&self, py: Python<'py>,
+                              module_import_path: &str,
+                              package_root: Option<&str>)
+        -> PyResult<PyObject>
+    {
+        Ok(match self.g.module_depends_on(module_import_path, package_root) {
+            None => PyNone::get_bound(py).into_py(py),
+            Some(deps) => {
+                let r = PySet::empty_bound(py)
+                    .or_else(|e| return Err(e))?;
+                for dep in deps {
+                    r.add(PyString::new_bound(py, &dep))?;
+                }
+                r.into_py(py)
+            }
+        })
+    }
+
+    #[pyo3(signature = (modified_files))]
+    fn affected_by<'py>(&self, py: Python<'py>, modified_files: Bound<'py, PyAny>)
+        -> PyResult<Bound<'py, PyDict>>
+    {
+        let modified_files : Vec<String> = to_vec(modified_files).or_else(|e| return Err(e))?;
+        let affected = py.allow_threads(|| self.g.affected_by(modified_files));
+
+        let r = PyDict::new_bound(py);
+        for (pkg, test_files) in &affected {
+            let files = PySet::empty_bound(py)?;
+            for file in test_files {
+                files.add(PyString::new_bound(py, &file))?
+            }
+            r.set_item(PyString::new_bound(py, &pkg), files)?
+        }
+
+        Ok(r)
+    }
+}
+
 #[pymodule]
 fn import_parser_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ImportParser>()?;
+    m.add_class::<ModuleGraph>()?;
     m.add("MismatchedOverrideComments", m.py().get_type_bound::<MismatchedOverrideComments>())?;
     Ok(())
 }
+
