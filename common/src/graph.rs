@@ -113,7 +113,33 @@ impl ModuleGraph {
         let mut imports = HashSet::new();
 
         for dep in deps {
-            if let Some(dep_ref)  = self.to_module_local_aware(pkg, ustr(&dep)) {
+            if dep.ends_with(".*") {
+                // NB: per python spec, star import only import submodules that are referenced in
+                // the __all__ variable set in a package's __init__.py
+                // Handling that accurately would require:
+                //  - evaluating __all__ which would necessarily have to rely on heuristics since
+                //    it could in theory be touched with arbitrary code, because that's how Python
+                //    rolls
+                //  - tracking the value of __all__ for all packages
+                //  - deferring resolution of * imports until the relevant package is parsed and
+                //    its __all__ value is known
+                //
+                // This is a tremendous amount of complexity for relatively little value. Instead,
+                // we can do something much easier: act as if __all__ contained all the submodules
+                // present on the filesystem.
+                // This might result in spurious additional dependencies, but it cannot possibly
+                // result in missed dependencies, and we're more concerned about false negatives
+                // than false positives.
+                // These "spurious" additional deps are in fact a feature, as it allows us to
+                // concisely inform the parser of some programmatically inserted dependencies
+                let target_pkg = &dep[..dep.len()-2];
+                if let Some(refs) = self.to_module_list_local_aware(pkg, ustr(target_pkg)) {
+                    refs.iter().for_each(|r| {
+                        imports.insert(*r);
+                    });
+                }
+            }
+            if let Some(dep_ref) = self.to_module_local_aware(pkg, ustr(&dep)) {
                 imports.insert(dep_ref);
             }
         }
@@ -223,6 +249,45 @@ impl ModuleGraph {
                 match self.packages.get(self.import_matcher.longest_prefix(&dep, '.')) {
                     Some(dep_pkg_fs) => self.to_module_with_cache(&dep_pkg_fs, dep, None),
                     None => self.to_module_with_cache(pkg, dep, Some(ustr(pkg))),
+                }
+            },
+        }
+    }
+
+    fn to_module_list(&self, pkg_path: &str, dep: Ustr, pkg: Option<Ustr>) -> Option<Vec<ModuleRef>>{
+        let target_path = pkg_path.to_string() + "/" + &dep.replace('.', "/");
+        match fs::read_dir(target_path) {
+            Err(_) => None,
+            Ok(entries) => {
+                Some(entries.filter_map(|entry| {
+                    match entry {
+                        Err(_) => None,
+                        Ok(e) => {
+                            if !e.file_type().unwrap().is_file() {
+                                return None
+                            }
+                            let name = e.file_name().to_str().unwrap().to_string();
+                            if name.ends_with(".py") && name != "__init__.py" {
+                                Some(name[..name.len()-3].to_string())
+                            } else {
+                                None
+                            }
+                        }
+                    }
+                }).filter_map(|sub| {
+                    let subdep = dep.to_string() + "." + &sub;
+                    self.to_module_with_cache(pkg_path, ustr(&subdep), pkg)
+                }).collect())
+            }
+        }
+    }
+    fn to_module_list_local_aware(&self, pkg: &str, dep: Ustr) -> Option<Vec<ModuleRef>> {
+        match self.is_local(&dep) {
+            None => None,
+            Some(_) => {
+                match self.packages.get(self.import_matcher.longest_prefix(&dep, '.')) {
+                    Some(dep_pkg_fs) => self.to_module_list(&dep_pkg_fs, dep, None),
+                    None => self.to_module_list(pkg, dep, Some(ustr(pkg))),
                 }
             },
         }
