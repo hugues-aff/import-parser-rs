@@ -600,19 +600,19 @@ where
     fn write_to<T: ?Sized + Writer<C>>(&self, w: &mut T) -> Result<(), C::Error> {
         write_length_u64_varint(self.global_ns.len(), w).or_else(|e| return Err(e))?;
         for (module, deps) in &self.global_ns {
-            w.write_u32(*module).or_else(|e| return Err(e))?;
+            w.write_u64_varint(*module as u64).or_else(|e| return Err(e))?;
             write_length_u64_varint(deps.len(), w).or_else(|e| return Err(e))?;
             for dep in deps {
-                w.write_u32(*dep).or_else(|e| return Err(e))?;
+                w.write_u64_varint(*dep as u64).or_else(|e| return Err(e))?;
             }
         }
 
         write_length_u64_varint(self.reversed.len(), w).or_else(|e| return Err(e))?;
         for (f, affected) in &self.reversed {
-            w.write_u32(*f).or_else(|e| return Err(e))?;
+            w.write_u64_varint(*f as u64).or_else(|e| return Err(e))?;
             write_length_u64_varint(affected.len(), w).or_else(|e| return Err(e))?;
             for test_file in affected {
-                w.write_u32(*test_file).or_else(|e| return Err(e))?;
+                w.write_u64_varint(*test_file as u64).or_else(|e| return Err(e))?;
             }
         }
         Ok(())
@@ -628,26 +628,30 @@ where
             .or_else(|e| return Err(e))?;
         let mut global_ns = HashMap::with_capacity(global_ns_len);
         for _ in 0..global_ns_len {
-            let mod_ref = reader.read_u32().or_else(|e| return Err(e))?;
+            let mod_ref = reader.read_u64_varint()
+                .or_else(|e| return Err(e))? as ModuleRef;
             let dep_len = read_length_u64_varint(reader).or_else(|e| return Err(e))?;
             let mut deps = HashSet::with_capacity(dep_len);
             for _ in 0..dep_len {
-                deps.insert(reader.read_u32().or_else(|e| return Err(e))? as ModuleRef);
+                deps.insert(reader.read_u64_varint()
+                    .or_else(|e| return Err(e))? as ModuleRef);
             }
-            global_ns.insert(mod_ref as ModuleRef, deps);
+            global_ns.insert(mod_ref, deps);
         }
 
         let reversed_len = read_length_u64_varint(reader)
             .or_else(|e| return Err(e))?;
         let mut reversed = HashMap::with_capacity(reversed_len);
         for _ in 0..reversed_len {
-            let mod_ref = reader.read_u32().or_else(|e| return Err(e))?;
+            let mod_ref = reader.read_u64_varint()
+                .or_else(|e| return Err(e))? as ModuleRef;
             let affected_len = read_length_u64_varint(reader).or_else(|e| return Err(e))?;
             let mut affected = HashSet::with_capacity(affected_len);
             for _ in 0..affected_len {
-                affected.insert(reader.read_u32().or_else(|e| return Err(e))? as ModuleRef);
+                affected.insert(reader.read_u64_varint()
+                    .or_else(|e| return Err(e))? as ModuleRef);
             }
-            reversed.insert(mod_ref as ModuleRef, affected);
+            reversed.insert(mod_ref, affected);
         }
 
         Ok(FinalizedModuleGraph{
@@ -670,8 +674,11 @@ where
         write_length_u64_varint(self.global_ns.len(), w)
             .or_else(|e| return Err(e))?;
         for l in self.global_ns.iter() {
-            w.write_u32(*l.key()).or_else(|e| return Err(e))?;
-            w.write_value(l.value()).or_else(|e| return Err(e))?;
+            w.write_u64_varint(*l.key() as u64).or_else(|e| return Err(e))?;
+            write_length_u64_varint(l.value().len(), w).or_else(|e| return Err(e))?;
+            for v in l.value() {
+                w.write_u64_varint(*v as u64).or_else(|e| return Err(e))?;
+            }
         }
 
         write_length_u64_varint(self.per_pkg_ns.len(), w).or_else(|e| return Err(e))?;
@@ -679,10 +686,10 @@ where
             write_ustr_to(*l.key(), w).or_else(|e| return Err(e))?;
             write_length_u64_varint(l.value().len(), w).or_else(|e| return Err(e))?;
             for it in l.value().iter() {
-                w.write_u32(*it.key() as u32).or_else(|e| return Err(e))?;
+                w.write_u64_varint(*it.key() as u64).or_else(|e| return Err(e))?;
                 write_length_u64_varint(it.value().len(), w).or_else(|e| return Err(e))?;
                 for v in it.value() {
-                    w.write_u32(*v).or_else(|e| return Err(e))?;
+                    w.write_u64_varint(*v as u64).or_else(|e| return Err(e))?;
                 }
             }
         }
@@ -709,10 +716,15 @@ where
             .or_else(|e| return Err(e))?;
         let global_ns = DashMap::with_capacity(global_ns_len);
         for _ in 0..global_ns_len {
-            let module_ref = reader.read_u32()
+            let module_ref = reader.read_u64_varint()
+                .or_else(|e| return Err(e))? as ModuleRef;
+            let dep_len = read_length_u64_varint(reader)
                 .or_else(|e| return Err(e))?;
-            let deps = reader.read_value()
-                .or_else(|e| return Err(e))?;
+            let mut deps = HashSet::new();
+            for _ in 0..dep_len {
+                deps.insert(reader.read_u64_varint()
+                    .or_else(|e| return Err(e))? as ModuleRef);
+            }
             global_ns.insert(module_ref, deps);
         }
 
@@ -728,12 +740,14 @@ where
                 .or_else(|e| return Err(e))?;
             let m = DashMap::with_capacity(ns_len);
             for _ in 0..ns_len {
-                let mod_ref = reader.read_u32().or_else(|e| return Err(e))?;
+                let mod_ref = reader.read_u64_varint()
+                    .or_else(|e| return Err(e))? as ModuleRef;
                 let dep_len = read_length_u64_varint(reader)
                     .or_else(|e| return Err(e))?;
                 let mut deps = HashSet::new();
                 for _ in 0..dep_len {
-                    deps.insert(reader.read_u32().or_else(|e| return Err(e))?);
+                    deps.insert(reader.read_u64_varint()
+                        .or_else(|e| return Err(e))? as ModuleRef);
                 }
                 m.insert(mod_ref, deps);
             }
