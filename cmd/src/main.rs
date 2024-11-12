@@ -4,6 +4,7 @@ use std::fs::read_to_string;
 use std::process::exit;
 use std::time::Instant;
 use common::graph::*;
+use common::transitive_closure::TransitiveClosure;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -12,7 +13,7 @@ fn main() {
         exit(1);
     }
 
-    let mut g: Option<ModuleGraph> = None;
+    let mut g: Option<TransitiveClosure> = None;
 
     for mut i in 1..args.len() {
         let start = Instant::now();
@@ -38,7 +39,7 @@ fn main() {
 
             eprintln!("building module graph for {} packages", packages.len());
 
-            let mut module_graph = ModuleGraph::new(
+            let module_graph = ModuleGraph::new(
                 packages,
                 HashSet::from_iter(["affirm".to_string()]),
                 HashSet::from_iter(["tests".to_string()]),
@@ -49,11 +50,11 @@ fn main() {
             eprintln!("built: {}",
                       Instant::now().duration_since(start).as_millis());
 
-            module_graph.finalize();
+            let tc = module_graph.finalize();
 
             eprintln!("finalized {}",
                       Instant::now().duration_since(start).as_millis());
-            g = Some(module_graph);
+            g.replace(tc);
         } else if &args[i] == "--save" && i+1 < args.len() {
             i += 1;
             if let Some(mg) = g.as_ref() {
@@ -64,7 +65,7 @@ fn main() {
                       Instant::now().duration_since(start).as_millis());
         } else if &args[i] == "--load" && i+1 < args.len() {
             i += 1;
-            g = Some(ModuleGraph::from_file(&args[i])
+            g.replace(TransitiveClosure::from_file(&args[i])
                 .expect("failed to deserialize module graph"));
             eprintln!("reloaded {}",
                       Instant::now().duration_since(start).as_millis());

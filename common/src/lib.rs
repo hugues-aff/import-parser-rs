@@ -2,6 +2,8 @@ pub mod cache;
 pub mod matcher;
 pub mod moduleref;
 pub mod graph;
+pub mod transitive_closure;
+pub mod parser;
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -13,8 +15,6 @@ use pyo3::create_exception;
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyException, PyOSError, PyValueError};
 use pyo3::types::{PyFrozenSet, PyString, PyTuple};
-use ruff_python_ast::{Stmt};
-use ruff_python_ast::visitor::source_order::{walk_stmt, SourceOrderVisitor};
 use ruff_text_size::{Ranged, TextRange};
 use ruff_python_parser::{parse_module, Token, TokenKind};
 use walkdir::WalkDir;
@@ -69,106 +69,6 @@ fn mismatched_comments(t: &str, line: usize) -> Err {
         format!("unmatched override {} at line {}", t, line),
         PyErr::new::<MismatchedOverrideComments, _>,
     )
-}
-
-pub fn split_at_depth(filepath: &'_ str, sep: char, depth: usize) -> (&'_ str, &'_ str) {
-    let mut idx : usize = filepath.len();
-    let mut depth: usize = depth;
-    while depth != 0 {
-        match filepath[..idx].rfind(sep) {
-            Some(next_idx) => {
-                idx = next_idx;
-                depth -= 1;
-            },
-            None => {
-                panic!("{} @ {} {}", filepath, sep, depth);
-            }
-        }
-    }
-    (&filepath[0..idx], &filepath[idx+1..])
-}
-
-struct ImportExtractor<'a> {
-    source : &'a str,
-    module : &'a str,
-    deep: bool,
-
-    imports : Vec<String>
-}
-
-impl<'a> ImportExtractor<'a> {
-    fn new(source : &'a str, module : &'a str, deep : bool) -> ImportExtractor<'a> {
-        ImportExtractor{
-            source,
-            module,
-            deep,
-            imports: Vec::new(),
-        }
-    }
-}
-
-impl<'a, 'b> SourceOrderVisitor<'b> for ImportExtractor<'a> {
-    fn visit_stmt(&mut self, stmt: &'b Stmt) {
-        if let Some(imp) = stmt.as_import_stmt() {
-            for n in &imp.names {
-                self.imports.push(n.name.to_string());
-            }
-        } else if let Some(imp) = stmt.as_import_from_stmt() {
-            let mut target = String::new();
-            if imp.level > 0 {
-                let (parent, _) = split_at_depth(self.module, '.', imp.level as usize);
-                target.push_str(parent);
-                target.push('.');
-            }
-            if imp.module.is_some() {
-                target.push_str(imp.module.as_ref().unwrap().as_str());
-                target.push('.');
-            }
-            for n in &imp.names {
-                self.imports.push(target.clone() + n.name.as_str());
-            }
-        } else if self.deep {
-            if let Some(if_stmt) = stmt.as_if_stmt() {
-                // quick and dirty: skip if TYPE_CHECKING / if typing.TYPE_CHECKING
-                // TODO: for added robustness:
-                //  - keep track of imports from typing package
-                //  - extract identifer from if condition and compare to imported symbol
-                let range = if_stmt.test.range();
-                let cond = &self.source[range.start().to_usize()..range.end().to_usize()];
-                if cond == "TYPE_CHECKING" || cond == "typing.TYPE_CHECKING" {
-                    // skip walking under
-                    return;
-                }
-            }
-            walk_stmt(self, stmt);
-        }
-    }
-
-    fn visit_body(&mut self, body: &'b [Stmt]) {
-        for stmt in body {
-            self.visit_stmt(stmt);
-        }
-    }
-}
-
-fn raw_imports_from_module<'a>(source: &'a str, module: &'a str, deep: bool) -> Result<Vec<String>, Err> {
-    match parse_module(source) {
-        Err(error) => Err(Err::new(error.to_string(), PyException::new_err)),
-        Ok(m) => {
-            let mut extractor = ImportExtractor::new(source, module, deep);
-            extractor.visit_body(&m.syntax().body);
-            Ok(extractor.imports)
-        }
-    }
-}
-
-pub fn raw_get_all_imports(filepath: &str, module: &str, deep: bool) -> Result<Vec<String>, Err> {
-    match read_to_string(filepath) {
-        Err(err) => Err(Err::from_io(err)),
-        Ok(source) => raw_imports_from_module(
-            &source, module, deep,
-        )
-    }
 }
 
 fn next_override_block(it: &mut core::slice::Iter<'_, Token>,

@@ -4,6 +4,8 @@ use pyo3::exceptions::{PyException, PyTypeError};
 use pyo3::types::{PyDict, PyNone, PySequence, PySet, PyString};
 
 use common::*;
+use common::graph;
+use common::transitive_closure::{TransitiveClosure};
 use common::cache;
 
 fn to_vec<'py, T>(v: Bound<'py, PyAny>) -> PyResult<Vec<T>>
@@ -81,9 +83,9 @@ impl ImportParser {
 
 }
 
-#[pyclass(subclass, frozen, module="import_parser_rs")]
+#[pyclass(subclass, module="import_parser_rs")]
 pub struct ModuleGraph {
-    g: graph::ModuleGraph,
+    tc: TransitiveClosure,
 }
 
 #[pymethods]
@@ -94,36 +96,48 @@ impl ModuleGraph {
            global_prefixes: HashSet<String>,
            local_prefixes: HashSet<String>,
     ) -> PyResult<ModuleGraph> {
-        let g = ModuleGraph{
-            g: graph::ModuleGraph::new(
+        let tc = py.allow_threads(|| {
+            let g = graph::ModuleGraph::new(
                 packages,
                 global_prefixes,
                 local_prefixes,
-            )
-        };
-        py.allow_threads(|| g.g.parse_parallel())
-            .or_else(|e| return Err(PyErr::new::<PyException, _>(e.to_string())))?;
-        Ok(g)
+            );
+            g.parse_parallel()?;
+            Ok(g.finalize())
+        }).or_else(|e: parser::Error| return Err(PyErr::new::<PyException, _>(e.to_string())))?;
+        Ok(ModuleGraph{ tc })
     }
 
     #[staticmethod]
     #[pyo3(signature = (filepath))]
     fn from_file<'py>(py: Python<'py>, filepath: &str) -> PyResult<ModuleGraph> {
         Ok(ModuleGraph {
-            g: py.allow_threads(|| graph::ModuleGraph::from_file(filepath))
+            tc: py.allow_threads(|| TransitiveClosure::from_file(filepath))
                 .or_else(|e| Err(PyErr::new::<PyException, _>(e.to_string())))?
         })
     }
+
     #[pyo3(signature = (filepath))]
     fn to_file<'py>(&self, py: Python<'py>, filepath: &str) -> PyResult<()> {
-        py.allow_threads(|| self.g.to_file(filepath))
+        py.allow_threads(|| self.tc.to_file(filepath))
             .or_else(|e| Err(PyErr::new::<PyException, _>(e.to_string())))
+    }
+
+    #[pyo3(signature = (simple_unified, simple_per_package))]
+    fn add_dynamic_dependencies_at_edges<'py>(&mut self, py: Python<'py>,
+                    simple_unified: HashMap<String, HashSet<String>>,
+                    simple_per_package: HashMap<String, HashMap<String, HashSet<String>>>
+    ) -> PyResult<()> {
+        py.allow_threads(|| {
+            self.tc.apply_dynamic_edges_at_leaves(&simple_unified, &simple_per_package)
+        });
+        Ok(())
     }
 
     #[pyo3(signature = (filepath))]
     fn file_depends_on<'py>(&self, py: Python<'py>, filepath: &str) -> PyResult<PyObject>
     {
-        Ok(match self.g.file_depends_on(filepath) {
+        Ok(match self.tc.file_depends_on(filepath) {
             None => PyNone::get_bound(py).into_py(py),
             Some(deps) => {
                 let r = PySet::empty_bound(py)
@@ -141,7 +155,7 @@ impl ModuleGraph {
                               package_root: Option<&str>)
         -> PyResult<PyObject>
     {
-        Ok(match self.g.module_depends_on(module_import_path, package_root) {
+        Ok(match self.tc.module_depends_on(module_import_path, package_root) {
             None => PyNone::get_bound(py).into_py(py),
             Some(deps) => {
                 let r = PySet::empty_bound(py)
@@ -159,7 +173,7 @@ impl ModuleGraph {
         -> PyResult<Bound<'py, PyDict>>
     {
         let modified_files : Vec<String> = to_vec(modified_files).or_else(|e| return Err(e))?;
-        let affected = py.allow_threads(|| self.g.affected_by(modified_files));
+        let affected = py.allow_threads(|| self.tc.affected_by(modified_files));
 
         let r = PyDict::new_bound(py);
         for (pkg, test_files) in &affected {

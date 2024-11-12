@@ -56,6 +56,15 @@ impl ModuleRefCache {
         }
     }
 
+    // FIXME: get read only refs after parsing...
+    pub fn clone(&self) -> Self {
+        Self::from_values(self.values.read().unwrap().to_vec())
+    }
+
+    pub fn max_value(&self) -> ModuleRef {
+        self.values.read().unwrap().len() as ModuleRef
+    }
+
     pub fn get(&self, r: ModuleRef) -> ModuleRefVal {
         self.values.read().unwrap()[r as usize]
     }

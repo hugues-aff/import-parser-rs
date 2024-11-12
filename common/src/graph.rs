@@ -1,21 +1,17 @@
 use std::collections::{HashMap, HashSet};
 use std::{fs, thread};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc};
 use std::time::Instant;
-use dashmap::{DashMap, DashSet};
+use dashmap::{DashMap};
 use ignore::{DirEntry, WalkBuilder, WalkState};
-use rayon::prelude::*;
-use ustr::{ustr, Ustr, UstrSet};
+use ustr::{ustr, Ustr};
 use speedy::{Context, LittleEndian, Readable, Reader, Writable, Writer};
 use speedy::private::{read_length_u64_varint, write_length_u64_varint};
 use crate::matcher::MatcherNode;
-use crate::moduleref::{read_ustr_with_buf, write_ustr_to, ModuleRef, ModuleRefCache};
-use crate::{raw_get_all_imports, split_at_depth};
-
-struct FinalizedModuleGraph {
-    global_ns: HashMap<ModuleRef, HashSet<ModuleRef>>,
-    reversed: HashMap<ModuleRef, HashSet<ModuleRef>>,
-}
+use crate::moduleref::{ModuleRef, ModuleRefCache};
+use crate::parser;
+use crate::parser::{raw_get_all_imports, split_at_depth};
+use crate::transitive_closure::{TransitiveClosure};
 
 
 pub struct ModuleGraph {
@@ -33,11 +29,7 @@ pub struct ModuleGraph {
 
     // collected imports
     global_ns: DashMap<ModuleRef, HashSet<ModuleRef>>,
-    per_pkg_ns: DashMap<Ustr, DashMap<ModuleRef, HashSet<ModuleRef>>>,
-
-    finalized: Option<FinalizedModuleGraph>,
 }
-
 
 impl ModuleGraph {
     pub fn new(
@@ -54,8 +46,6 @@ impl ModuleGraph {
             modules_refs: ModuleRefCache::new(),
             to_module_cache: DashMap::new(),
             global_ns: DashMap::new(),
-            per_pkg_ns: DashMap::new(),
-            finalized: None,
         }
     }
 
@@ -65,8 +55,6 @@ impl ModuleGraph {
         local_prefixes: HashSet<String>,
         modules_refs: ModuleRefCache,
         global_ns: DashMap<ModuleRef, HashSet<ModuleRef>>,
-        per_pkg_ns: DashMap<Ustr, DashMap<ModuleRef, HashSet<ModuleRef>>>,
-        finalized: Option<FinalizedModuleGraph>,
     ) -> ModuleGraph {
         ModuleGraph {
             import_matcher: MatcherNode::from(packages.keys(), '.'),
@@ -77,8 +65,6 @@ impl ModuleGraph {
             modules_refs,
             to_module_cache: DashMap::new(),
             global_ns,
-            per_pkg_ns,
-            finalized,
         }
     }
 
@@ -146,13 +132,12 @@ impl ModuleGraph {
 
         let module = ustr(module);
         let filepath = ustr(filepath);
-        if is_local {
-            self.per_pkg_ns.entry(ustr(pkg))
-                .or_default()
-                .insert(self.modules_refs.get_or_create(filepath, module, Some(ustr(pkg))), imports);
+        let module_ref = if is_local {
+            self.modules_refs.get_or_create(filepath, module, Some(ustr(pkg)))
         } else {
-            self.global_ns.insert(self.modules_refs.get_or_create(filepath, module, None), imports);
-        }
+            self.modules_refs.get_or_create(filepath, module, None)
+        };
+        self.global_ns.insert(module_ref, imports);
     }
 
     fn exists_case_sensitive(dir: &str, name: &str) -> bool {
@@ -293,7 +278,7 @@ impl ModuleGraph {
         }
     }
 
-    pub fn parse_parallel(&self) -> Result<(), crate::Err> {
+    pub fn parse_parallel(&self) -> Result<(), crate::parser::Error> {
         let parallelism = thread::available_parallelism().unwrap().get();
 
         let mut package_it = self.packages.values();
@@ -306,7 +291,7 @@ impl ModuleGraph {
         self.global_prefixes.iter().for_each(|n| { prefixes.insert(n.clone()); });
         self.local_prefixes.iter().for_each(|n| { prefixes.insert(n.clone()); });
 
-        let (tx, rx) = mpsc::channel::<crate::Err>();
+        let (tx, rx) = mpsc::channel::<crate::parser::Error>();
 
         // NB: we have to disable handling of .gitignore because
         // some real smart folks have ignore patterns that match
@@ -324,10 +309,10 @@ impl ModuleGraph {
             Box::new(move |r| {
                 match r {
                     Err(err) => {
-                        tx.send(crate::Err::from_io(err.into_io_error().unwrap())).unwrap();
+                        tx.send(parser::Error::IO(err.into_io_error().unwrap())).unwrap();
                         WalkState::Quit
                     }
-                    Ok(e) => self._parse(e, &tx)
+                    Ok(e) => self.parse_one_file(e, &tx)
                 }
             })
         });
@@ -336,14 +321,14 @@ impl ModuleGraph {
 
         // check for errors during the walk
         for err in rx.iter() {
-            eprintln!("{}", err.msg);
+            eprintln!("{}", err);
             // NB: we only return the first one...
             return Err(err);
         }
         Ok(())
     }
 
-    fn _parse(&self, e: DirEntry, tx: &mpsc::Sender<crate::Err>) -> WalkState {
+    fn parse_one_file(&self, e: DirEntry, tx: &mpsc::Sender<crate::parser::Error>) -> WalkState {
         let filename = e.file_name().to_str().unwrap();
         //eprintln!("{}", filename);
         if !filename.ends_with(".py") {
@@ -374,82 +359,12 @@ impl ModuleGraph {
         }
     }
 
-    pub fn finalize(&mut self) {
+    pub fn finalize(&self) -> TransitiveClosure {
         let start = Instant::now();
-
         reify_deps(&self.global_ns, &self.modules_refs);
+        eprintln!("reified {}", Instant::now().duration_since(start).as_millis());
 
-        eprintln!("reified {}",
-                  Instant::now().duration_since(start).as_millis());
-
-        let mut g = closed_graph_par(&self.global_ns);
-
-        eprintln!("closed {}",
-                  Instant::now().duration_since(start).as_millis());
-
-        // finish up: close per-package test graph and reverse it into a global
-        // map of python files to set of affected test files, grouped by package
-        // the end goal is a way to easily map affected test files from modified files
-
-        let rev_tg = affected_test_files(&mut g, &self.per_pkg_ns, &self.modules_refs);
-
-        eprintln!("closed/reversed tests {}",
-                  Instant::now().duration_since(start).as_millis());
-
-        self.finalized = Some(FinalizedModuleGraph {
-            global_ns: g,
-            reversed: rev_tg,
-        });
-    }
-
-    pub fn file_depends_on(&self, filepath: &str) -> Option<HashSet<Ustr>> {
-        self.modules_refs.ref_for_fs(ustr(filepath))
-            .map(|m| self.depends_on(m))?
-    }
-
-    pub fn module_depends_on(&self, module_import_path: &str, pkg_base: Option<&str>) -> Option<HashSet<Ustr>> {
-        self.modules_refs.ref_for_py(ustr(module_import_path), pkg_base.map(ustr))
-            .map(|m| self.depends_on(m))?
-    }
-
-    fn depends_on(&self, m: ModuleRef) -> Option<HashSet<Ustr>> {
-        self.finalized.as_ref().unwrap().global_ns.get(&m)
-            .map(|r| HashSet::from_iter(
-                r.iter().map(|dep| self.modules_refs.py_for_ref(*dep))
-            ))
-    }
-
-    pub fn affected_by<T: AsRef<str>, L: IntoIterator<Item=T>>(&self, modified_files: L) -> HashMap<Ustr, UstrSet> {
-        let affected = &self.finalized.as_ref().unwrap().reversed;
-
-        let mut all_test_modes = HashSet::new();
-        for modified_file in modified_files {
-            let modified_file = modified_file.as_ref();
-            match self.modules_refs.ref_for_fs(ustr(&modified_file)) {
-                None => {
-                    eprintln!("not a relevant python module: {}", modified_file);
-                    continue
-                },
-                Some(module_ref) => {
-                    match affected.get(&module_ref) {
-                        None => {
-                            eprintln!("0 tests affected by: {}", modified_file);
-                        },
-                        Some(test_mods) => {
-                            eprintln!("{} tests affected by: {}", modified_file, test_mods.len());
-                            all_test_modes.extend(test_mods);
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut grouped_by_pkg: HashMap<Ustr, UstrSet> = HashMap::new();
-        for test_mod in all_test_modes {
-            let rv = self.modules_refs.get(test_mod);
-            grouped_by_pkg.entry(rv.pkg.unwrap()).or_default().insert(rv.fs);
-        }
-        grouped_by_pkg
+        TransitiveClosure::from(&self.global_ns, &self.modules_refs)
     }
 }
 
@@ -485,216 +400,25 @@ fn reify_deps(g: &DashMap<ModuleRef, HashSet<ModuleRef>>,
     }
 }
 
-fn _dfs(g_in: &DashMap<ModuleRef, HashSet<ModuleRef>>,
-        edges_out: &mut HashSet<ModuleRef>,
-        a: ModuleRef, b: ModuleRef)
-{
-    if let Some(deps) = g_in.get(&b) {
-        for c in deps.value() {
-            if *c != a && edges_out.insert(*c) {
-                _dfs(g_in, edges_out, a, *c)
-            }
-        }
-    }
-}
-
-fn closed_graph_seq(g: &DashMap<ModuleRef, HashSet<ModuleRef>>) -> HashMap<ModuleRef, HashSet<ModuleRef>> {
-    let mut g_out = HashMap::with_capacity(g.len());
-
-    for it in g.iter() {
-        let start = it.key().clone();
-        let mut deps = HashSet::new();
-        _dfs(g, &mut deps, start, start);
-        g_out.insert(start, deps);
-    }
-    g_out
-}
-
-fn closed_graph_par(g: &DashMap<ModuleRef, HashSet<ModuleRef>>) -> HashMap<ModuleRef, HashSet<ModuleRef>> {
-    let g_out = Mutex::new(HashMap::with_capacity(g.len()));
-
-    g.par_iter().for_each(|it| {
-        let start = it.key().clone();
-        let mut deps = HashSet::new();
-        _dfs(g, &mut deps, start, start);
-        {
-            g_out.lock().unwrap().insert(start, deps);
-        }
-    });
-    g_out.into_inner().unwrap()
-}
-
-fn affected_for_pkg(g: &HashMap<ModuleRef, HashSet<ModuleRef>>,
-                    tg: &DashMap<ModuleRef, HashSet<ModuleRef>>,
-                    ref_cache: &ModuleRefCache,
-) -> (HashMap<ModuleRef, HashSet<ModuleRef>>, HashMap<ModuleRef, HashSet<ModuleRef>>)
-{
-    reify_deps(tg, ref_cache);
-    let mut ctg = closed_graph_seq(tg);
-
-    let mut affected: HashMap<ModuleRef, HashSet<ModuleRef>> = HashMap::new();
-
-    for (test_file, deps) in &mut ctg {
-        let extra = DashSet::new();
-        for dep in deps.iter() {
-            affected.entry(*dep).or_default().insert(*test_file);
-            if let Some(trans) = g.get(&dep) {
-                for tdep in trans {
-                    extra.insert(*tdep);
-                    affected.entry(*tdep).or_default().insert(*test_file);
-                }
-            }
-        }
-        deps.extend(extra);
-        // extend global ns
-        //g.insert(*test_file, deps);
-    }
-    (ctg, affected)
-}
-
-fn affected_test_files(g: &mut HashMap<ModuleRef, HashSet<ModuleRef>>,
-                       test_imports: &DashMap<Ustr, DashMap<ModuleRef, HashSet<ModuleRef>>>,
-                       ref_cache: &ModuleRefCache)
--> HashMap<ModuleRef, HashSet<ModuleRef>> {
-
-    let (tx, rx) =
-        mpsc::channel::<HashMap<ModuleRef, HashSet<ModuleRef>>>();
-
-    let (tx2, rx2) =
-        mpsc::channel::<HashMap<ModuleRef, HashSet<ModuleRef>>>();
-
-    // build up affected files in parallel
-    let t = thread::spawn(move || {
-        let mut affected: HashMap<ModuleRef, HashSet<ModuleRef>> = HashMap::new();
-        for a in rx.iter() {
-            for (file, v) in &a {
-                let affected = affected.entry(*file).or_default();
-                for test_file in v {
-                    affected.insert(*test_file);
-                }
-            }
-        }
-        affected
-    });
-
-    test_imports.par_iter().for_each_with((tx, tx2), |(tx, tx2), it| {
-        let pkg = it.key();
-        let (cg, aff) = affected_for_pkg(g, &test_imports.get(pkg).unwrap(), ref_cache);
-        tx.send(aff).unwrap();
-        tx2.send(cg).unwrap();
-    });
-
-    // update global ns after parallel iter it done
-    for cg in rx2.iter() {
-        g.extend(cg);
-    }
-
-    // wait for joiner thread to be done
-    t.join().unwrap()
-}
-
-impl<C> Writable<C> for FinalizedModuleGraph
-where
-    C: Context
-{
-    fn write_to<T: ?Sized + Writer<C>>(&self, w: &mut T) -> Result<(), C::Error> {
-        write_length_u64_varint(self.global_ns.len(), w).or_else(|e| return Err(e))?;
-        for (module, deps) in &self.global_ns {
-            w.write_u64_varint(*module as u64).or_else(|e| return Err(e))?;
-            write_length_u64_varint(deps.len(), w).or_else(|e| return Err(e))?;
-            for dep in deps {
-                w.write_u64_varint(*dep as u64).or_else(|e| return Err(e))?;
-            }
-        }
-
-        write_length_u64_varint(self.reversed.len(), w).or_else(|e| return Err(e))?;
-        for (f, affected) in &self.reversed {
-            w.write_u64_varint(*f as u64).or_else(|e| return Err(e))?;
-            write_length_u64_varint(affected.len(), w).or_else(|e| return Err(e))?;
-            for test_file in affected {
-                w.write_u64_varint(*test_file as u64).or_else(|e| return Err(e))?;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl<'a, C> Readable<'a, C> for FinalizedModuleGraph
-where
-    C: Context
-{
-    fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
-        let global_ns_len = read_length_u64_varint(reader)
-            .or_else(|e| return Err(e))?;
-        let mut global_ns = HashMap::with_capacity(global_ns_len);
-        for _ in 0..global_ns_len {
-            let mod_ref = reader.read_u64_varint()
-                .or_else(|e| return Err(e))? as ModuleRef;
-            let dep_len = read_length_u64_varint(reader).or_else(|e| return Err(e))?;
-            let mut deps = HashSet::with_capacity(dep_len);
-            for _ in 0..dep_len {
-                deps.insert(reader.read_u64_varint()
-                    .or_else(|e| return Err(e))? as ModuleRef);
-            }
-            global_ns.insert(mod_ref, deps);
-        }
-
-        let reversed_len = read_length_u64_varint(reader)
-            .or_else(|e| return Err(e))?;
-        let mut reversed = HashMap::with_capacity(reversed_len);
-        for _ in 0..reversed_len {
-            let mod_ref = reader.read_u64_varint()
-                .or_else(|e| return Err(e))? as ModuleRef;
-            let affected_len = read_length_u64_varint(reader).or_else(|e| return Err(e))?;
-            let mut affected = HashSet::with_capacity(affected_len);
-            for _ in 0..affected_len {
-                affected.insert(reader.read_u64_varint()
-                    .or_else(|e| return Err(e))? as ModuleRef);
-            }
-            reversed.insert(mod_ref, affected);
-        }
-
-        Ok(FinalizedModuleGraph{
-            global_ns,
-            reversed,
-        })
-    }
-}
-
 impl<C> Writable<C> for ModuleGraph
 where
     C: Context
 {
     fn write_to<T: ?Sized + Writer<C>>(&self, w: &mut T) -> Result<(), C::Error> {
-        w.write_value(&self.packages).or_else(|e| return Err(e))?;
-        w.write_value(&self.global_prefixes).or_else(|e| return Err(e))?;
-        w.write_value(&self.local_prefixes).or_else(|e| return Err(e))?;
-        w.write_value(&self.modules_refs).or_else(|e| return Err(e))?;
+        w.write_value(&self.packages)?;
+        w.write_value(&self.global_prefixes)?;
+        w.write_value(&self.local_prefixes)?;
+        w.write_value(&self.modules_refs)?;
 
-        write_length_u64_varint(self.global_ns.len(), w)
-            .or_else(|e| return Err(e))?;
+        write_length_u64_varint(self.global_ns.len(), w)?;
         for l in self.global_ns.iter() {
-            w.write_u64_varint(*l.key() as u64).or_else(|e| return Err(e))?;
-            write_length_u64_varint(l.value().len(), w).or_else(|e| return Err(e))?;
+            w.write_u64_varint(*l.key() as u64)?;
+            write_length_u64_varint(l.value().len(), w)?;
             for v in l.value() {
-                w.write_u64_varint(*v as u64).or_else(|e| return Err(e))?;
+                w.write_u64_varint(*v as u64)?;
             }
         }
-
-        write_length_u64_varint(self.per_pkg_ns.len(), w).or_else(|e| return Err(e))?;
-        for l in self.per_pkg_ns.iter() {
-            write_ustr_to(*l.key(), w).or_else(|e| return Err(e))?;
-            write_length_u64_varint(l.value().len(), w).or_else(|e| return Err(e))?;
-            for it in l.value().iter() {
-                w.write_u64_varint(*it.key() as u64).or_else(|e| return Err(e))?;
-                write_length_u64_varint(it.value().len(), w).or_else(|e| return Err(e))?;
-                for v in it.value() {
-                    w.write_u64_varint(*v as u64).or_else(|e| return Err(e))?;
-                }
-            }
-        }
-
-        w.write_value(&self.finalized)
+        Ok(())
     }
 }
 
@@ -703,59 +427,23 @@ where
     C: Context
 {
     fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
-        let packages = reader.read_value()
-            .or_else(|e| return Err(e))?;
-        let global_prefixes = reader.read_value()
-            .or_else(|e| return Err(e))?;
-        let local_prefixes = reader.read_value()
-            .or_else(|e| return Err(e))?;
-        let modules_refs = reader.read_value()
-            .or_else(|e| return Err(e))?;
+        let packages = reader.read_value()?;
+        let global_prefixes = reader.read_value()?;
+        let local_prefixes = reader.read_value()?;
+        let modules_refs = reader.read_value()?;
 
-        let global_ns_len = read_length_u64_varint(reader)
-            .or_else(|e| return Err(e))?;
+        let global_ns_len = read_length_u64_varint(reader)?;
         let global_ns = DashMap::with_capacity(global_ns_len);
         for _ in 0..global_ns_len {
-            let module_ref = reader.read_u64_varint()
-                .or_else(|e| return Err(e))? as ModuleRef;
-            let dep_len = read_length_u64_varint(reader)
-                .or_else(|e| return Err(e))?;
+            let module_ref = reader.read_u64_varint()? as ModuleRef;
+            let dep_len = read_length_u64_varint(reader)?;
             let mut deps = HashSet::new();
             for _ in 0..dep_len {
-                deps.insert(reader.read_u64_varint()
-                    .or_else(|e| return Err(e))? as ModuleRef);
+                deps.insert(reader.read_u64_varint()? as ModuleRef);
             }
             global_ns.insert(module_ref, deps);
         }
 
-        let mut buf = Vec::new();
-        let per_pkg_ns_len = read_length_u64_varint(reader)
-            .or_else(|e| return Err(e))?;
-        let per_pkg_ns = DashMap::with_capacity(per_pkg_ns_len);
-        for _ in 0..per_pkg_ns_len {
-            let pkg = read_ustr_with_buf(reader, &mut buf)
-                .or_else(|e| return Err(e))?;
-
-            let ns_len = read_length_u64_varint(reader)
-                .or_else(|e| return Err(e))?;
-            let m = DashMap::with_capacity(ns_len);
-            for _ in 0..ns_len {
-                let mod_ref = reader.read_u64_varint()
-                    .or_else(|e| return Err(e))? as ModuleRef;
-                let dep_len = read_length_u64_varint(reader)
-                    .or_else(|e| return Err(e))?;
-                let mut deps = HashSet::new();
-                for _ in 0..dep_len {
-                    deps.insert(reader.read_u64_varint()
-                        .or_else(|e| return Err(e))? as ModuleRef);
-                }
-                m.insert(mod_ref, deps);
-            }
-            per_pkg_ns.insert(pkg, m);
-        }
-
-        let finalized = reader.read_value()
-            .or_else(|e| return Err(e))?;
 
         Ok(ModuleGraph::from(
             packages,
@@ -763,9 +451,6 @@ where
             local_prefixes,
             modules_refs,
             global_ns,
-            per_pkg_ns,
-            finalized,
         ))
     }
 }
-
