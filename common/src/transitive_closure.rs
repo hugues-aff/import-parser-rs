@@ -3,11 +3,13 @@ use dashmap::DashMap;
 use speedy::private::{read_length_u64_varint, write_length_u64_varint};
 use speedy::{Context, LittleEndian, Readable, Reader, Writable, Writer};
 use ustr::{ustr, Ustr, UstrSet};
+use hi_sparse_bitset::{BitSet, BitSetInterface};
+use hi_sparse_bitset::config::{_128bit};
 use crate::moduleref::{ModuleRef, ModuleRefCache};
 
 type CondensedRef = usize;
 type CondensedNode = HashSet<ModuleRef>;
-type CondensedEdges = HashSet<CondensedRef>;
+type CondensedEdges = BitSet<_128bit>;
 
 pub struct TransitiveClosure {
     // map filesystem / python paths <-> ModuleRef
@@ -19,10 +21,10 @@ pub struct TransitiveClosure {
     condensed_to_mod: Vec<CondensedNode>,
 
     // map CondensedRef -> Set of CondensedRef successors (transitive closure)
-    successor: Vec<HashSet<CondensedRef>>,
+    successor: Vec<CondensedEdges>,
 
     // map CondensedRef -> Set of CondensedRef ancestors (transitive closure)
-    ancestor: Vec<HashSet<CondensedRef>>,
+    ancestor: Vec<CondensedEdges>,
 }
 
 impl TransitiveClosure {
@@ -52,8 +54,8 @@ impl TransitiveClosure {
         let mut ancestor = Vec::with_capacity(n);
         ancestor.resize_with(n, CondensedEdges::new);
         for c in 0..state.scc.len() as CondensedRef {
-            for &succ in &state.succ[c] {
-                ancestor[succ as usize].insert(c);
+            for succ in &state.succ[c] {
+                ancestor[succ].insert(c);
             }
         }
 
@@ -94,8 +96,8 @@ impl TransitiveClosure {
 
     pub fn depends_on(&self, m: ModuleRef) -> Option<HashSet<Ustr>> {
         let mut deps = HashSet::new();
-        for &c in &self.successor[self.mod_to_condensed[m as usize] as usize] {
-            for &v in &self.condensed_to_mod[c as usize] {
+        for c in &self.successor[self.mod_to_condensed[m as usize] as usize] {
+            for &v in &self.condensed_to_mod[c] {
                 deps.insert(self.module_refs.py_for_ref(v));
             }
         }
@@ -116,10 +118,10 @@ impl TransitiveClosure {
                 Some(module_ref) => {
                     match self.ancestor.get(self.mod_to_condensed[module_ref as usize]) {
                         None => {
-                            eprintln!("0 tests affected by: {}", modified_file);
+                            // eprintln!("0 tests affected by: {}", modified_file);
                         },
                         Some(scc) => {
-                            eprintln!("{} tests affected by: {}", modified_file, scc.len());
+                            // eprintln!("{} tests affected by: {}", modified_file, scc.len());
                             all_sccs.extend(scc);
                         }
                     }
@@ -163,6 +165,8 @@ struct StackTC {
 // closure into the same single Depth-First Traversal, and uses a minimal number of set union to
 // compute it. This ensures optimal asymptotic complexity, with low constant factors, as well as
 // noticeable improvements in speed and memory usage for graphs with sizeable SCCs
+// See also https://dub.uu.nl/sites/default/files/legacy/other/INF-SCR-10-10.pdf for an alternative
+// description and related context.
 fn stack_tc(s: &mut StackTC, v: ModuleRef, g: &DashMap<ModuleRef, HashSet<ModuleRef>>) {
     s.root[v as usize] = v;
     s.saved_height[v as usize] = s.cstack.len();
@@ -192,10 +196,8 @@ fn stack_tc(s: &mut StackTC, v: ModuleRef, g: &DashMap<ModuleRef, HashSet<Module
 
     if s.root[v as usize] == v {
         assert_eq!(s.scc.len(), s.succ.len());
-        // TODO: use sorted list? or sparse bitset?
         let cv = s.scc.len() as CondensedRef;
         s.comp[v as usize] = cv;
-        // TODO: use sparse bitsets?
         let mut succ = CondensedEdges::new();
         if *s.vstack.last().unwrap() != v {
             succ.insert(cv);
@@ -203,9 +205,9 @@ fn stack_tc(s: &mut StackTC, v: ModuleRef, g: &DashMap<ModuleRef, HashSet<Module
         assert!(s.cstack.len() >= s.saved_height[v as usize]);
         while s.cstack.len() > s.saved_height[v as usize] {
             let x = s.cstack.pop().unwrap();
-            if !succ.contains(&x) {
+            if !succ.contains(x) {
                 succ.insert(x);
-                for &sx in &s.succ[x] {
+                for sx in &s.succ[x] {
                     succ.insert(sx);
                 }
             }
@@ -242,7 +244,7 @@ pub fn apply_dynamic_edges_at_leaves(
                     if let Some(mod_ref) = tc.module_refs.ref_for_py(ustr(&d), None) {
                         let cref = tc.mod_to_condensed[mod_ref as usize];
                         extra_deps.insert(cref);
-                        for &succ in &tc.successor[cref as usize] {
+                        for succ in &tc.successor[cref as usize] {
                             extra_deps.insert(succ);
                         }
                     }
@@ -255,28 +257,27 @@ pub fn apply_dynamic_edges_at_leaves(
 
     // apply triggers
     for (&trigger, per_pkg_dep) in &triggers {
-        for &triggered in &tc.ancestor[trigger as usize] {
+        for triggered in &tc.ancestor[trigger as usize] {
             // NB: only add successors to SCCs that have no ancestors themselves
-            if !&tc.ancestor[triggered as usize].is_empty() {
+            if !&tc.ancestor[triggered].is_empty() {
                 continue;
             }
 
             // pick any module within the SCC to determine package membership
             // by construction, nodes in an SCC are either all within the global ns
             // or all within a single package-local ns
-            let v = *tc.condensed_to_mod[triggered as usize].iter().next().unwrap();
+            let v = *tc.condensed_to_mod[triggered].iter().next().unwrap();
             let rv = tc.module_refs.get(v);
 
             if let Some(pkg) = rv.pkg {
                 if let Some(extra_deps) = per_pkg_dep.get(&pkg) {
-                    let _ = CondensedEdges::with_capacity(extra_deps.len());
-                    for &extra_dep in extra_deps {
+                    for extra_dep in extra_deps {
                         assert_ne!(trigger, extra_dep);
                         // this is simple because:
                         // 1. we have checked that triggered has no ancestors
                         // 2. the preprocessing loop earlier ensured that we have
                         //    a complete set of extra_deps to work with
-                        tc.successor[triggered as usize].insert(extra_dep);
+                        tc.successor[triggered].insert(extra_dep);
                         // sigh, this is annoying
                         // rust borrow checker doesn't have a way to mix mutable
                         // and immutable access to a vector even if the elements
@@ -285,7 +286,7 @@ pub fn apply_dynamic_edges_at_leaves(
                         // if it could leverage assertions about indices being
                         // distinct...
                         unsafe {
-                            std::ptr::from_ref(&tc.ancestor[extra_dep as usize])
+                            std::ptr::from_ref(&tc.ancestor[extra_dep])
                                 .cast_mut().as_mut().unwrap().insert(triggered);
                         }
                     }
@@ -319,14 +320,14 @@ where
             }
 
             let edges = &self.successor[i];
-            write_length_u64_varint(edges.len(), w)?;
-            for &dep in edges {
+            write_length_u64_varint(edges.iter().count(), w)?;
+            for dep in edges {
                 w.write_u64_varint(dep as u64)?;
             }
 
             let tc = &self.ancestor[i];
-            write_length_u64_varint(tc.len(), w)?;
-            for &dep in tc {
+            write_length_u64_varint(tc.iter().count(), w)?;
+            for dep in tc {
                 w.write_u64_varint(dep as u64)?;
             }
         }
@@ -360,14 +361,14 @@ where
             condensed_to_mod.push(scc);
 
             let l = read_length_u64_varint(reader)?;
-            let mut succ = HashSet::with_capacity(l);
+            let mut succ = CondensedEdges::new();
             for _ in 0..l {
                 succ.insert(reader.read_u64_varint()? as CondensedRef);
             }
             successor.push(succ);
 
             let l = read_length_u64_varint(reader)?;
-            let mut anc = HashSet::with_capacity(l);
+            let mut anc = CondensedEdges::new();
             for _ in 0..l {
                 anc.insert(reader.read_u64_varint()? as CondensedRef);
             }

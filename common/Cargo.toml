@@ -22,3 +22,4 @@ ruff_python_ast = { workspace = true }
 ruff_text_size = { workspace = true }
 pyo3 = { workspace = true }
 speedy = { workspace = true }
+hi_sparse_bitset = { workspace = true }

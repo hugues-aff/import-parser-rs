@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::{fs, thread};
 use std::sync::{mpsc};
 use std::time::Instant;
-use dashmap::{DashMap};
+use dashmap::{DashMap, Entry};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 use ustr::{ustr, Ustr};
 use speedy::{Context, LittleEndian, Readable, Reader, Writable, Writer};
@@ -26,6 +26,7 @@ pub struct ModuleGraph {
 
     modules_refs: ModuleRefCache,
     to_module_cache: DashMap<Ustr, ModuleRef>,
+    dir_cache: DashMap<String, HashSet<String>>,
 
     // collected imports
     global_ns: DashMap<ModuleRef, HashSet<ModuleRef>>,
@@ -45,6 +46,7 @@ impl ModuleGraph {
             local_prefixes,
             modules_refs: ModuleRefCache::new(),
             to_module_cache: DashMap::new(),
+            dir_cache: DashMap::new(),
             global_ns: DashMap::new(),
         }
     }
@@ -64,6 +66,7 @@ impl ModuleGraph {
             local_prefixes,
             modules_refs,
             to_module_cache: DashMap::new(),
+            dir_cache: DashMap::new(),
             global_ns,
         }
     }
@@ -140,16 +143,35 @@ impl ModuleGraph {
         self.global_ns.insert(module_ref, imports);
     }
 
-    fn exists_case_sensitive(dir: &str, name: &str) -> bool {
-        match fs::read_dir(dir) {
-            Err(_) => false,
-            Ok(mut entries) => {
-                entries.any(|entry| entry.unwrap().file_name() == name)
+    fn exists_case_sensitive(&self, dir: &str, name: &str) -> bool {
+        if !fs::exists(dir.to_string() + "/" + name).unwrap_or(false) {
+            return false;
+        }
+        // TODO: try the same file name with a different case before falling back to read_dir...
+        // NB: read dir is expensive, but it's the only way to ensure we're looking
+        // at the proper file unfortunately...
+        match self.dir_cache.entry(dir.to_string()) {
+            Entry::Vacant(e) => {
+                match fs::read_dir(dir) {
+                    Err(_) => false,
+                    Ok(entries) => {
+                        let mut children = HashSet::new();
+                        for e in entries {
+                            children.insert(e.unwrap().file_name().to_str().unwrap().to_string());
+                        }
+                        let exists = children.contains(name);
+                        e.insert(children);
+                        exists
+                    }
+                }
+            },
+            Entry::Occupied(e) => {
+                e.get().contains(name)
             }
         }
     }
 
-    fn module_path(filepath: &str) -> Option<String> {
+    fn module_path(&self, filepath: &str) -> Option<String> {
         // Oh joy! on case-sensitive filesystems we want to make sure we resolve
         // module paths in a way that is consistent with what Python itself does
         // as formalized in PEP 235 https://peps.python.org/pep-0235/
@@ -170,14 +192,14 @@ impl ModuleGraph {
         //      from foo import Bar
         //
         // we want to resolve that last form into an import to foo.bar, not foo.Bar!
+        if self.exists_case_sensitive(filepath, "__init__.py") {
+            return Some(filepath.to_string() + "/__init__.py")
+        }
         let py = filepath.to_string() + ".py";
         if let Some((dir, name)) = py.rsplit_once('/') {
-            if Self::exists_case_sensitive(dir, name) {
+            if self.exists_case_sensitive(dir, name) {
                 return Some(py)
             }
-        }
-        if Self::exists_case_sensitive(filepath, "__init__.py") {
-            return Some(filepath.to_string() + "/__init__.py")
         }
         None
     }
@@ -185,7 +207,7 @@ impl ModuleGraph {
     fn to_module_no_cache(&self, pkg_path: &str, dep: Ustr, ref_pkg: Option<Ustr>) -> Option<ModuleRef> {
         let depfile = pkg_path.to_string() + "/" + &dep.replace('.', "/");
         let mut idx = dep.rfind('.');
-        if let Some(actual) = Self::module_path(depfile.as_str()) {
+        if let Some(actual) = self.module_path(depfile.as_str()) {
             return Some(self.modules_refs.get_or_create(ustr(&actual), dep, ref_pkg))
         } else {
             // need to allow for a walk all the way up because:
@@ -199,7 +221,7 @@ impl ModuleGraph {
             while idx.is_some() {
                 let parent = &dep[..idx.unwrap()];
                 let parentfile = &depfile[..pkg_path.len()+1+idx.unwrap()];
-                if let Some(actual) = Self::module_path(parentfile) {
+                if let Some(actual) = self.module_path(parentfile) {
                     return Some(self.modules_refs.get_or_create(ustr(&actual), ustr(parent), ref_pkg))
                 }
                 idx = parent.rfind('.')
@@ -360,10 +382,7 @@ impl ModuleGraph {
     }
 
     pub fn finalize(&self) -> TransitiveClosure {
-        let start = Instant::now();
         reify_deps(&self.global_ns, &self.modules_refs);
-        eprintln!("reified {}", Instant::now().duration_since(start).as_millis());
-
         TransitiveClosure::from(&self.global_ns, &self.modules_refs)
     }
 }
