@@ -1,6 +1,6 @@
 [package]
 name = "common"
-version = "0.1.2"
+version = "0.3.0"
 publish = false
 edition = {  workspace = true }
 rust-version = { workspace = true }
@@ -23,3 +23,4 @@ ruff_text_size = { workspace = true }
 pyo3 = { workspace = true }
 speedy = { workspace = true }
 hi_sparse_bitset = { workspace = true }
+zstd = { workspace = true }

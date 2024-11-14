@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use dashmap::DashMap;
 use speedy::private::{read_length_u64_varint, write_length_u64_varint};
-use speedy::{Context, LittleEndian, Readable, Reader, Writable, Writer};
+use speedy::{Context, Error, LittleEndian, Readable, Reader, Writable, Writer};
 use ustr::{ustr, Ustr, UstrSet};
-use hi_sparse_bitset::{BitSet, BitSetInterface};
+use hi_sparse_bitset::{BitSet};
 use hi_sparse_bitset::config::{_128bit};
 use crate::moduleref::{ModuleRef, ModuleRefCache};
 
@@ -68,12 +69,21 @@ impl TransitiveClosure {
         }
     }
 
-    pub fn from_file(filepath: &str) -> Result<TransitiveClosure, speedy::Error> {
-        Self::read_from_file_with_ctx(LittleEndian::default(), filepath)
+    pub fn from_file(filepath: &str) -> Result<TransitiveClosure, Error> {
+        let file = File::open(filepath)
+            .map_err(|e| Error::custom(e.to_string()))?;
+        let stream = zstd::Decoder::new(file)
+            .map_err(|e| Error::custom(e.to_string()))?;
+        Self::read_from_stream_buffered_with_ctx(LittleEndian::default(), stream)
     }
 
-    pub fn to_file(&self, filepath: &str) -> Result<(), speedy::Error> {
-        self.write_to_file_with_ctx(LittleEndian::default(), filepath)
+    pub fn to_file(&self, filepath: &str) -> Result<(), Error> {
+        let file = File::create(filepath)
+            .map_err(|e| Error::custom(e.to_string()))?;
+        let stream = zstd::Encoder::new(file, 0)
+            .map_err(|e| Error::custom(e.to_string()))?
+            .auto_finish();
+        self.write_to_stream_with_ctx(LittleEndian::default(), stream)
     }
 
     pub fn apply_dynamic_edges_at_leaves(
