@@ -123,7 +123,7 @@ if __name__ == '__main__':
     t = Tracker()
     t.start_tracking(hook.GLOBAL_NAMESPACES | hook.LOCAL_NAMESPACES,
                      patches=getattr(hook, 'IMPORT_PATCHES', {}),
-                     record_dynamic=True)
+                     record_dynamic=getattr(hook, 'RECORD_DYNAMIC', False))
 
     if hasattr(hook, 'setup'):
         hook.setup()
@@ -173,8 +173,8 @@ if __name__ == '__main__':
         errors = {}
 
         # catch stdout/stderr to prevent noise from packages being imported
-        capture_out = hasattr(hook, 'capture_stdout') and hook.capture_stdout()
-        capture_err = hasattr(hook, 'capture_stderr') and hook.capture_stderr()
+        capture_out = getattr(hook, 'CAPTURE_STDOUT', True)
+        capture_err = getattr(hook, 'CAPTURE_STDERR', True)
 
         with io.StringIO() as f:
             with contextlib.redirect_stdout(f) if capture_out else contextlib.nullcontext(), \
