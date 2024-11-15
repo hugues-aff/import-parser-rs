@@ -236,71 +236,137 @@ fn stack_tc(s: &mut StackTC, v: ModuleRef, g: &DashMap<ModuleRef, HashSet<Module
     }
 }
 
-pub fn apply_dynamic_edges_at_leaves(
-    tc: &mut TransitiveClosure,
-    simple_unified: &HashMap<String, HashSet<String>>,
-    simple_per_package: &HashMap<String, HashMap<String, HashSet<String>>>,
-) {
-    // convert text-based triggers to appropriate internal repr
+
+fn convert_deps(tc: &TransitiveClosure, deps: &HashSet<String>) -> CondensedEdges {
+    let mut extra_deps = CondensedEdges::new();
+    for d in deps {
+        if let Some(mod_ref) = tc.module_refs.ref_for_py(ustr(&d), None) {
+            let cref = tc.mod_to_condensed[mod_ref as usize];
+            extra_deps.insert(cref);
+            for succ in &tc.successor[cref as usize] {
+                extra_deps.insert(succ);
+            }
+        }
+    }
+    extra_deps
+}
+
+fn convert_unified(
+    tc: &TransitiveClosure,
+    unified: &HashMap<String, HashSet<String>>,
+) -> HashMap<CondensedRef, CondensedEdges>{
     let mut triggers = HashMap::new();
-    for (trigger, per_pkg_deps) in simple_per_package {
+    for (trigger, deps) in unified {
+        if let Some(mod_ref) = tc.module_refs.ref_for_py(ustr(&trigger), None) {
+            triggers.insert(tc.mod_to_condensed[mod_ref as usize], convert_deps(tc, deps));
+        }
+    }
+    triggers
+}
+
+fn convert_package_varying(
+    tc: &TransitiveClosure,
+    per_package: &HashMap<String, HashMap<String, HashSet<String>>>,
+) -> HashMap<CondensedRef, HashMap<Ustr, CondensedEdges>>{
+    let mut triggers = HashMap::with_capacity(per_package.len());
+    for (trigger, per_pkg_deps) in per_package {
         if let Some(mod_ref) = tc.module_refs.ref_for_py(ustr(&trigger), None) {
             let c = tc.mod_to_condensed[mod_ref as usize];
             let mut dep_map = HashMap::with_capacity(per_pkg_deps.len());
             for (pkg, deps) in per_pkg_deps {
-                let p = ustr(pkg.as_str());
-                let mut extra_deps = CondensedEdges::new();
-                for d in deps {
-                    if let Some(mod_ref) = tc.module_refs.ref_for_py(ustr(&d), None) {
-                        let cref = tc.mod_to_condensed[mod_ref as usize];
-                        extra_deps.insert(cref);
-                        for succ in &tc.successor[cref as usize] {
-                            extra_deps.insert(succ);
-                        }
-                    }
-                }
-                dep_map.insert(p, extra_deps);
+                dep_map.insert(ustr(pkg.as_str()), convert_deps(tc, deps));
             }
             triggers.insert(c, dep_map);
         }
     }
+    triggers
+}
 
-    // apply triggers
-    for (&trigger, per_pkg_dep) in &triggers {
-        for triggered in &tc.ancestor[trigger as usize] {
-            // NB: only add successors to SCCs that have no ancestors themselves
-            if !&tc.ancestor[triggered].is_empty() {
-                continue;
-            }
 
-            // pick any module within the SCC to determine package membership
-            // by construction, nodes in an SCC are either all within the global ns
-            // or all within a single package-local ns
-            let v = *tc.condensed_to_mod[triggered].iter().next().unwrap();
-            let rv = tc.module_refs.get(v);
+pub fn apply_dynamic_edges_at_leaves(
+    tc: &mut TransitiveClosure,
+    unified: &HashMap<String, HashSet<String>>,
+    per_package: &HashMap<String, HashMap<String, HashSet<String>>>,
+) {
+    for (&t, deps) in &convert_unified(tc, unified) {
+        apply_unified_trigger(tc, t, deps)
+    }
+    for (&t, deps) in &convert_package_varying(tc, per_package) {
+        apply_package_vaying_trigger(tc, t, deps)
+    }
+}
 
-            if let Some(pkg) = rv.pkg {
-                if let Some(extra_deps) = per_pkg_dep.get(&pkg) {
-                    for extra_dep in extra_deps {
-                        assert_ne!(trigger, extra_dep);
-                        // this is simple because:
-                        // 1. we have checked that triggered has no ancestors
-                        // 2. the preprocessing loop earlier ensured that we have
-                        //    a complete set of extra_deps to work with
-                        tc.successor[triggered].insert(extra_dep);
-                        // sigh, this is annoying
-                        // rust borrow checker doesn't have a way to mix mutable
-                        // and immutable access to a vector even if the elements
-                        // being accessed are disjoint. To be fair, it's hard to
-                        // prove in the general case, although it would be nice
-                        // if it could leverage assertions about indices being
-                        // distinct...
-                        unsafe {
-                            std::ptr::from_ref(&tc.ancestor[extra_dep])
-                                .cast_mut().as_mut().unwrap().insert(triggered);
-                        }
-                    }
-                }
+fn apply_trigger(
+    successors: &mut Vec<CondensedEdges>,
+    ancestors: &Vec<CondensedEdges>,  // NB: we're lying about this, but it's okay...
+    trigger: CondensedRef,
+    triggered: CondensedRef,
+    extra_deps: &CondensedEdges,
+) {
+    assert_ne!(triggered, trigger);
+    for extra_dep in extra_deps {
+        if trigger == extra_dep || triggered == extra_dep {
+            continue;
+        }
+        // this is simple because:
+        // 1. we have checked that triggered has no ancestors
+        // 2. the preprocessing loop earlier ensured that we have
+        //    a complete set of extra_deps to work with
+        successors[triggered].insert(extra_dep);
+        // sigh, this is annoying
+        // rust borrow checker doesn't have a way to mix mutable
+        // and immutable access to a vector even if the elements
+        // being accessed are disjoint. To be fair, it's hard to
+        // prove in the general case, although it would be nice
+        // if it could leverage assertions about indices being
+        // distinct...
+        unsafe {
+            std::ptr::from_ref(&ancestors[extra_dep])
+                .cast_mut().as_mut().unwrap().insert(triggered);
+        }
+    }
+}
+
+fn apply_unified_trigger(
+    tc: &mut TransitiveClosure,
+    trigger: CondensedRef,
+    extra_deps: &CondensedEdges,
+) {
+    for triggered in &tc.ancestor[trigger as usize] {
+        if triggered == trigger {
+            continue;
+        }
+        // NB: only add successors to SCCs that have no ancestors themselves
+        if !&tc.ancestor[triggered].is_empty() {
+            continue;
+        }
+        apply_trigger(&mut tc.successor, &tc.ancestor, trigger, triggered, extra_deps);
+    }
+}
+
+fn apply_package_vaying_trigger(
+    tc: &mut TransitiveClosure,
+    trigger: CondensedRef,
+    per_pkg_dep: &HashMap<Ustr, CondensedEdges>,
+) {
+    for triggered in &tc.ancestor[trigger as usize] {
+        if triggered == trigger {
+            continue;
+        }
+        // NB: only add successors to SCCs that have no ancestors themselves
+        if !&tc.ancestor[triggered].is_empty() {
+            continue;
+        }
+
+        // pick any module within the SCC to determine package membership
+        // by construction, nodes in an SCC are either all within the global ns
+        // or all within a single package-local ns
+        let v = *tc.condensed_to_mod[triggered].iter().next().unwrap();
+        let rv = tc.module_refs.get(v);
+
+        if let Some(pkg) = rv.pkg {
+            if let Some(extra_deps) = per_pkg_dep.get(&pkg) {
+                apply_trigger(&mut tc.successor, &tc.ancestor, trigger, triggered, extra_deps);
             }
         }
     }

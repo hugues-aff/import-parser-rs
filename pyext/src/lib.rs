@@ -142,13 +142,14 @@ impl ModuleGraph {
             Some(deps) => {
                 let r = PySet::empty_bound(py)
                     .or_else(|e| return Err(e))?;
-                for dep in deps {
-                    r.add(PyString::new_bound(py, &dep))?;
+                for dep in &deps {
+                    r.add(PyString::new_bound(py, dep))?;
                 }
                 r.into_py(py)
             }
         })
     }
+
     #[pyo3(signature = (module_import_path, package_root = None))]
     fn module_depends_on<'py>(&self, py: Python<'py>,
                               module_import_path: &str,
@@ -160,8 +161,8 @@ impl ModuleGraph {
             Some(deps) => {
                 let r = PySet::empty_bound(py)
                     .or_else(|e| return Err(e))?;
-                for dep in deps {
-                    r.add(PyString::new_bound(py, &dep))?;
+                for dep in &deps {
+                    r.add(PyString::new_bound(py, dep))?;
                 }
                 r.into_py(py)
             }
