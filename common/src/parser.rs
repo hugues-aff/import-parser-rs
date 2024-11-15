@@ -1,8 +1,8 @@
 use std::fmt::Display;
 use std::fs::read_to_string;
 use std::io;
-use ruff_python_ast::Stmt;
-use ruff_python_ast::visitor::source_order::{walk_stmt, SourceOrderVisitor};
+use ruff_python_ast::{Expr, Stmt};
+use ruff_python_ast::visitor::source_order::{walk_expr, walk_stmt, SourceOrderVisitor};
 use ruff_text_size::{Ranged};
 use ruff_python_parser::{parse_module, ParseError};
 
@@ -60,6 +60,8 @@ impl<'a> ImportExtractor<'a> {
 
 impl<'a, 'b> SourceOrderVisitor<'b> for ImportExtractor<'a> {
     fn visit_stmt(&mut self, stmt: &'b Stmt) {
+        // TODO: detect any expression with a call to the __import__ builtin
+        // those should be reported
         if let Some(imp) = stmt.as_import_stmt() {
             for n in &imp.names {
                 self.imports.push(n.name.to_string());
@@ -83,7 +85,7 @@ impl<'a, 'b> SourceOrderVisitor<'b> for ImportExtractor<'a> {
                 // quick and dirty: skip if TYPE_CHECKING / if typing.TYPE_CHECKING
                 // TODO: for added robustness:
                 //  - keep track of imports from typing package
-                //  - extract identifer from if condition and compare to imported symbol
+                //  - extract identifier from if condition and compare to imported symbol
                 let range = if_stmt.test.range();
                 let cond = &self.source[range.start().to_usize()..range.end().to_usize()];
                 if cond == "TYPE_CHECKING" || cond == "typing.TYPE_CHECKING" {
@@ -93,6 +95,18 @@ impl<'a, 'b> SourceOrderVisitor<'b> for ImportExtractor<'a> {
             }
             walk_stmt(self, stmt);
         }
+    }
+
+    fn visit_expr(&mut self, expr: &'b Expr) {
+        if let Some(name) = expr.as_name_expr() {
+            if name.id.as_str() == "__import__" {
+                // could be:
+                //      builtins.__import__ (which does not require an import)
+                //      importlib.__import__
+                self.imports.push("__import__".to_string());
+            }
+        }
+        walk_expr(self, expr);
     }
 
     fn visit_body(&mut self, body: &'b [Stmt]) {

@@ -91,16 +91,19 @@ pub struct ModuleGraph {
 #[pymethods]
 impl ModuleGraph {
     #[new]
-    #[pyo3(signature = (packages, global_prefixes, local_prefixes))]
-    fn new<'py>(py: Python<'py>, packages: HashMap<String, String>,
-           global_prefixes: HashSet<String>,
-           local_prefixes: HashSet<String>,
+    #[pyo3(signature = (packages, global_prefixes, local_prefixes, external_prefixes=HashSet::default()))]
+    fn new<'py>(py: Python<'py>,
+                packages: HashMap<String, String>,
+                global_prefixes: HashSet<String>,
+                local_prefixes: HashSet<String>,
+                external_prefixes: HashSet<String>,
     ) -> PyResult<ModuleGraph> {
         let tc = py.allow_threads(|| {
             let g = graph::ModuleGraph::new(
                 packages,
                 global_prefixes,
                 local_prefixes,
+                external_prefixes,
             );
             g.parse_parallel()?;
             Ok(g.finalize())

@@ -116,7 +116,10 @@ impl ModuleRefCache {
             let rv = ModuleRefVal::new(fs.clone(), py.clone(), pkg.clone());
             let r = g.len() as ModuleRef;
             g.push(rv);
-            self.fs_to_ref.insert(fs, r);
+            // NB: external prefixes have no fs path
+            if !fs.is_empty() {
+                self.fs_to_ref.insert(fs, r);
+            }
             match pkg {
                 Some(pkg) => self.py_to_ref_local.entry(pkg).or_default().insert(py, r),
                 None => self.py_to_ref_global.insert(py, r),

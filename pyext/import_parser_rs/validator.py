@@ -139,6 +139,7 @@ if __name__ == '__main__':
             hook.package_map(),
             hook.GLOBAL_NAMESPACES,     # unified namespace
             hook.LOCAL_NAMESPACES,      # per-pkg namespace
+            getattr(hook, 'EXTERNAL_IMPORTS', frozenset()),
         )
 
         if hasattr(hook, 'dynamic_dependencies'):

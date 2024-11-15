@@ -20,6 +20,10 @@ pub struct ModuleGraph {
     global_prefixes: HashSet<String>,
     local_prefixes: HashSet<String>,
 
+    // import to track even without matching code
+    // most useful to track importlib and __import___
+    external_prefixes: HashSet<String>,
+
     // prefix matching for package import/package paths
     import_matcher: MatcherNode,
     package_matcher: MatcherNode,
@@ -37,6 +41,7 @@ impl ModuleGraph {
         packages: HashMap<String, String>,
         global_prefixes: HashSet<String>,
         local_prefixes: HashSet<String>,
+        external_prefixes: HashSet<String>,
     ) -> ModuleGraph {
         ModuleGraph{
             import_matcher: MatcherNode::from(packages.keys(), '.'),
@@ -44,6 +49,7 @@ impl ModuleGraph {
             packages,
             global_prefixes,
             local_prefixes,
+            external_prefixes,
             modules_refs: ModuleRefCache::new(),
             to_module_cache: DashMap::new(),
             dir_cache: DashMap::new(),
@@ -55,6 +61,7 @@ impl ModuleGraph {
         packages: HashMap<String, String>,
         global_prefixes: HashSet<String>,
         local_prefixes: HashSet<String>,
+        external_prefixes: HashSet<String>,
         modules_refs: ModuleRefCache,
         global_ns: DashMap<ModuleRef, HashSet<ModuleRef>>,
     ) -> ModuleGraph {
@@ -64,6 +71,7 @@ impl ModuleGraph {
             packages,
             global_prefixes,
             local_prefixes,
+            external_prefixes,
             modules_refs,
             to_module_cache: DashMap::new(),
             dir_cache: DashMap::new(),
@@ -102,6 +110,10 @@ impl ModuleGraph {
         let mut imports = HashSet::new();
 
         for dep in deps {
+            if self.external_prefixes.contains(&dep) {
+                imports.insert(self.modules_refs.get_or_create(ustr(""), ustr(&dep), None));
+                continue
+            }
             if dep.ends_with(".*") {
                 // NB: per python spec, star import only import submodules that are referenced in
                 // the __all__ variable set in a package's __init__.py
@@ -126,6 +138,7 @@ impl ModuleGraph {
                     refs.iter().for_each(|r| {
                         imports.insert(*r);
                     });
+                    continue
                 }
             }
             if let Some(dep_ref) = self.to_module_local_aware(pkg, ustr(&dep)) {
@@ -427,6 +440,7 @@ where
         w.write_value(&self.packages)?;
         w.write_value(&self.global_prefixes)?;
         w.write_value(&self.local_prefixes)?;
+        w.write_value(&self.external_prefixes)?;
         w.write_value(&self.modules_refs)?;
 
         write_length_u64_varint(self.global_ns.len(), w)?;
@@ -449,6 +463,7 @@ where
         let packages = reader.read_value()?;
         let global_prefixes = reader.read_value()?;
         let local_prefixes = reader.read_value()?;
+        let external_prefixes = reader.read_value()?;
         let modules_refs = reader.read_value()?;
 
         let global_ns_len = read_length_u64_varint(reader)?;
@@ -468,6 +483,7 @@ where
             packages,
             global_prefixes,
             local_prefixes,
+            external_prefixes,
             modules_refs,
             global_ns,
         ))

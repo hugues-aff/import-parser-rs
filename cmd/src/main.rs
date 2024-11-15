@@ -43,6 +43,7 @@ fn main() {
                 packages,
                 HashSet::from_iter(["affirm".to_string()]),
                 HashSet::from_iter(["tests".to_string()]),
+                HashSet::new(),
             );
 
             module_graph.parse_parallel().expect("failed to parse module graph");
