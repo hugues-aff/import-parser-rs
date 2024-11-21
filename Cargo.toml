@@ -11,9 +11,11 @@ crate-type = ["cdylib"]
 debug = 1
 
 [dependencies]
-pyo3 = { version = "0.22.5", features = ["abi3-py37", "extension-module"] }
+pyo3 = { version = "0.22.6", features = ["abi3-py37", "extension-module"] }
 walkdir = "2.5"
+ignore = "0.4.23"
 dashmap = "6.1"
+rayon = "1.10.0"
 ruff_python_parser = { git = "https://github.com/astral-sh/ruff.git", tag = "0.7.4" }
 ruff_python_ast = { git = "https://github.com/astral-sh/ruff.git", tag = "0.7.4" }
 ruff_text_size = { git = "https://github.com/astral-sh/ruff.git", tag = "0.7.4" }
