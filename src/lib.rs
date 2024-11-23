@@ -1,10 +1,12 @@
 mod cache;
 mod imports;
+mod configs;
 
+use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use pyo3::create_exception;
 use pyo3::prelude::*;
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
 use pyo3::types::{PyFrozenSet, PyNone, PySequence, PySet, PyString};
 
 create_exception!(import_parser_rs, MismatchedOverrideComments, PyValueError);
@@ -95,9 +97,34 @@ impl ImportParser {
     }
 }
 
+
+#[pyfunction]
+#[pyo3(signature = (paths, file_rx, key_rx=None, value_rx=None))]
+fn collect_values_from_configs<'py>(paths: Vec<String>, file_rx: String,
+                                    key_rx: Option<String>, value_rx: Option<String>)
+    -> PyResult<HashMap<String, HashSet<String>>>
+{
+    let file_filter = Regex::new(&file_rx).unwrap();
+    let key_filter = key_rx.map(|k| Regex::new(&k).unwrap());
+    let value_filter = value_rx.map(|k| Regex::new(&k).unwrap());
+
+    match configs::collect_strings_from_configs(
+        paths,
+        |name| file_filter.is_match(name),
+        key_filter.map(|rx| move |v: &str| rx.is_match(v)),
+        value_filter.map(|rx| move |v: &str| rx.is_match(v)),
+    ) {
+        Err(e) => Err(PyErr::new::<PyException, _>(format!("{:?}", e))),
+        Ok(values) => {
+            Ok(values.unwrap_or_default())
+        }
+    }
+}
+
 #[pymodule]
 fn import_parser_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ImportParser>()?;
+    m.add_function(wrap_pyfunction!(collect_values_from_configs, m)?)?;
     m.add("MismatchedOverrideComments", m.py().get_type_bound::<MismatchedOverrideComments>())?;
     Ok(())
 }

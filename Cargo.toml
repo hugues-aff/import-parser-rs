@@ -15,7 +15,10 @@ pyo3 = { version = "0.22.6", features = ["abi3-py37", "extension-module"] }
 walkdir = "2.5"
 ignore = "0.4.23"
 dashmap = "6.1"
-rayon = "1.10.0"
+regex = "1.11.1"
 ruff_python_parser = { git = "https://github.com/astral-sh/ruff.git", tag = "0.7.4" }
 ruff_python_ast = { git = "https://github.com/astral-sh/ruff.git", tag = "0.7.4" }
 ruff_text_size = { git = "https://github.com/astral-sh/ruff.git", tag = "0.7.4" }
+# need custom patch to relax some indentation enforcement on flow quoted strings
+# which is a deviation from standards, but matches pyyaml/libyaml
+yaml-rust2 = { git = "https://github.com/hugues-aff/yaml-rust2.git", rev = "7c236b8" }
